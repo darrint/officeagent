@@ -56,6 +56,7 @@
               gotools
               golangci-lint
               sqlite
+              dolt
               bd
             ];
             shellHook = ''
