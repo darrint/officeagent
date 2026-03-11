@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "officeagent",
+  "project_id": "108d2ef6-9ed3-46ed-8a1a-a2e176d4e9d5"
+}
