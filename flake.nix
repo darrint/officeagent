@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    beads.url = "github:steveyegge/beads";
+    beads.url = "github:steveyegge/beads/v0.59.0";
   };
 
   outputs =
@@ -31,7 +31,11 @@
     in
     {
       devShells = forAllSystems (
-        { pkgs, system, ... }:
+        {
+          pkgs,
+          system,
+          ...
+        }:
         {
           default = pkgs.mkShell {
             buildInputs = with pkgs; [
