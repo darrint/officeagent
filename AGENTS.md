@@ -43,23 +43,6 @@ Initialize in this repo if not already done:
 bd init
 ```
 
-## Tasks to do
-
-1. Install beads (`bd init`) and seed initial tasks into it. AND Transfter this
-   and any other task lists to beads. (`bd`)
-2. Initialize the Go module (`go mod init`).
-3. Scaffold the backend server: HTTP server, routes, config loading.
-4. Implement Microsoft Graph API client: OAuth2 device-code flow, email read,
-   calendar read.
-5. Implement local Office file parser: `.docx` (unioffice or go-docx), `.xlsx`
-   (excelize).
-6. Implement GitHub Copilot API LLM client using beads for prompt chaining and
-   context management.
-7. Build the web UI (served embedded in the binary).
-8. Wire everything together: agent loop, tool dispatch, conversation history in
-   SQLite.
-9. Cross-compile release binary for Windows (`GOOS=windows go build`).
-
 ## Dev environment
 
 ```sh
