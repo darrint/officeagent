@@ -31,11 +31,22 @@
     in
     {
       devShells = forAllSystems (
-        {
-          pkgs,
-          system,
-          ...
-        }:
+        { pkgs, ... }:
+        let
+          bd = pkgs.buildGoModule {
+            pname = "bd";
+            version = "0.59.0";
+            src = beads;
+            subPackages = [ "cmd/bd" ];
+            doCheck = false;
+            vendorHash = "sha256-ygZPi56fVEHaEShGVGpObFkrLs1DHrM8i2Y4BktMmpA=";
+            postPatch = ''
+              goVer="$(go env GOVERSION | sed 's/^go//')"
+              sed -i "s/^go .*/go $goVer/" go.mod
+            '';
+            env.GOTOOLCHAIN = "auto";
+          };
+        in
         {
           default = pkgs.mkShell {
             buildInputs = with pkgs; [
@@ -45,7 +56,7 @@
               gotools
               golangci-lint
               sqlite
-              beads.packages.${system}.default
+              bd
             ];
             shellHook = ''
               echo "officeagent development shell"
