@@ -12,9 +12,9 @@ See README.md for the full architecture.
 ## Tech stack
 
 - **Language**: Go
-- **LLM**: GitHub Copilot API (Claude)
+- **LLM**: GitHub Models API (default: `gpt-4o-mini`); Copilot API migration planned for Claude access
 - **Email/Calendar**: Microsoft Graph API
-- **Office files**: Direct file parsing (Go libraries, no COM/Office required)
+- **Office files**: Via Microsoft Graph API and Windows-specific APIs (direct Go parsing explicitly deferred)
 - **Prompt chaining**: [beads](https://github.com/steveyegge/beads) (`bd`)
 - **Storage**: Embedded SQLite
 - **Web UI**: Served from the Go binary (embedded assets)
@@ -31,10 +31,11 @@ bd update <id> --claim  # claim and start a task
 bd show <id>      # view task details
 ```
 
-Install `bd` once if not present:
+`bd` is provided by the Nix dev shell (built from source at v0.59.0 — the
+nixpkgs package was stale). If working outside Nix, install manually:
 
 ```sh
-go install github.com/steveyegge/beads/cmd/bd@latest
+go install github.com/steveyegge/beads/cmd/bd@v0.59.0
 ```
 
 Initialize in this repo if not already done:
@@ -46,10 +47,54 @@ bd init
 ## Dev environment
 
 ```sh
-nix develop   # drops into shell with Go, gopls, golangci-lint, sqlite, git
+nix develop   # drops into shell with Go, gopls, golangci-lint, sqlite, git, dolt, bd, gh
 ```
 
 Or install Go 1.22+, git, sqlite manually.
+
+## LLM setup
+
+The LLM client uses the GitHub Models API by default.
+
+**Environment variables:**
+- `GITHUB_TOKEN` — GitHub OAuth token with `copilot` scope. Get it via:
+  ```sh
+  gh auth login --scopes copilot
+  export GITHUB_TOKEN=$(gh auth token)
+  ```
+- `OFFICEAGENT_LLM_MODEL` — model ID (default: `gpt-4o-mini`)
+
+Keep these in an uncommitted `tokens.sh` (already in `.gitignore`) for local dev:
+```sh
+export GITHUB_TOKEN=$(gh auth token)
+export OFFICEAGENT_LLM_MODEL=gpt-4o-mini
+```
+
+**Two different APIs with different model availability:**
+
+| API | Base URL | Auth | Claude? |
+|-----|----------|------|---------|
+| GitHub Models | `models.inference.ai.azure.com` | PAT as Bearer | No |
+| GitHub Copilot | `api.githubcopilot.com` | OAuth token + token exchange | Yes |
+
+Switching to the Copilot API requires a short-lived token exchange step
+(`POST api.github.com/copilot_internal/v2/token`). This is tracked as a
+separate task.
+
+## Known gotchas
+
+**Azure OAuth:**
+- Auth code + PKCE works. Device code flow is blocked by enterprise Conditional
+  Access policies — do not use it.
+- The redirect URI must be registered under the **"Mobile and desktop applications"**
+  platform in Azure Portal (not "Web"), otherwise Azure demands a `client_secret`.
+- `oauth2.AuthStyleInParams` must be set explicitly on the endpoint; without it
+  the library probes with `Authorization: Basic`, confusing Azure into treating
+  the app as a confidential client.
+
+**GitHub Copilot token exchange:**
+- `POST api.github.com/copilot_internal/v2/token` rejects PATs with 403. It
+  requires an OAuth token obtained via `gh auth login --scopes copilot`.
 
 ## Code conventions
 
