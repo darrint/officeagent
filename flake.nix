@@ -58,6 +58,7 @@
               sqlite
               dolt
               bd
+              gh
             ];
             shellHook = ''
               echo "officeagent development shell"
