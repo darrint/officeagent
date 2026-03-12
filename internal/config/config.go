@@ -33,7 +33,7 @@ type Config struct {
 
 	// LLMModel is the model identifier passed to the LLM completions API.
 	// Set via OFFICEAGENT_LLM_MODEL environment variable.
-	// Defaults to gpt-4o-mini.
+	// Defaults to claude-sonnet-4.6.
 	LLMModel string
 }
 
@@ -49,7 +49,7 @@ func Default() *Config {
 	}
 	llmModel := os.Getenv("OFFICEAGENT_LLM_MODEL")
 	if llmModel == "" {
-		llmModel = "gpt-4o-mini"
+		llmModel = "claude-sonnet-4.6"
 	}
 	return &Config{
 		Addr:          "127.0.0.1:8080",

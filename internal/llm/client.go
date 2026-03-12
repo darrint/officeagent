@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const modelsAPIBase = "https://models.inference.ai.azure.com"
+const copilotAPIBase = "https://api.githubcopilot.com"
 
 // Message is a single chat turn.
 type Message struct {
@@ -30,9 +30,10 @@ type completionResponse struct {
 	} `json:"choices"`
 }
 
-// Client makes LLM requests via the GitHub Models API.
-// Authentication is a GitHub PAT or OAuth token passed directly as a Bearer
-// token — no secondary token exchange is required.
+// Client makes LLM requests via the GitHub Copilot API.
+// A GitHub OAuth token with the `copilot` scope (obtained via
+// `gh auth login --scopes copilot`) is used directly as a Bearer token —
+// no secondary token exchange is required.
 type Client struct {
 	githubToken string
 	model       string
@@ -40,7 +41,7 @@ type Client struct {
 }
 
 // NewClient creates an LLM client that authenticates with the given GitHub
-// token and calls the given model.
+// OAuth token and calls the given model via the Copilot API.
 func NewClient(githubToken, model string) *Client {
 	return &Client{
 		githubToken: githubToken,
@@ -60,7 +61,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		modelsAPIBase+"/chat/completions", bytes.NewReader(body))
+		copilotAPIBase+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
