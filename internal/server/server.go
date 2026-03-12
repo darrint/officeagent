@@ -78,6 +78,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /login/status", s.handleLoginStatus)
 	s.mux.HandleFunc("GET /settings", s.handleSettingsGet)
 	s.mux.HandleFunc("POST /settings", s.handleSettingsPost)
+	s.mux.HandleFunc("POST /feedback", s.handleFeedback)
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
 	s.mux.HandleFunc("GET /api/calendar/summary", s.handleCalendarSummary)
@@ -126,6 +127,11 @@ details{margin-top:1.5rem}
 details summary{cursor:pointer;font-size:.82rem;color:#888;user-select:none;padding:.4rem 0}
 details summary:hover{color:#555}
 details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;font-size:.8rem;line-height:1.5;overflow-x:auto;margin-top:.5rem;white-space:pre-wrap;word-break:break-all}
+.feedback{display:flex;align-items:center;gap:.5rem;margin-top:.75rem;flex-wrap:wrap}
+.feedback button{background:none;border:1px solid #ddd;border-radius:6px;padding:.3rem .7rem;font-size:1rem;cursor:pointer;line-height:1}
+.feedback button:hover{border-color:#0078d4;background:#f0f6ff}
+.feedback input[type=text]{flex:1;min-width:160px;padding:.3rem .6rem;font-size:.82rem;border:1px solid #ddd;border-radius:6px;color:#1a1a1a}
+.feedback input[type=text]:focus{outline:none;border-color:#0078d4}
 </style>
 </head>
 <body>
@@ -141,12 +147,28 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
   <div class="section">
     <div class="section-title">Email</div>
     {{if .Email.Error}}<div class="error">{{.Email.Error}}</div>
-    {{else}}<div class="card">{{.Email.HTML}}</div>{{end}}
+    {{else}}
+    <div class="card">{{.Email.HTML}}</div>
+    <form method="POST" action="/feedback" class="feedback">
+      <input type="hidden" name="section" value="email">
+      <button type="submit" name="rating" value="good" title="Helpful">👍</button>
+      <button type="submit" name="rating" value="bad" title="Needs improvement">👎</button>
+      <input type="text" name="note" placeholder="What should be different? (optional)" maxlength="300">
+    </form>
+    {{end}}
   </div>
   <div class="section">
     <div class="section-title">Calendar</div>
     {{if .Calendar.Error}}<div class="error">{{.Calendar.Error}}</div>
-    {{else}}<div class="card">{{.Calendar.HTML}}</div>{{end}}
+    {{else}}
+    <div class="card">{{.Calendar.HTML}}</div>
+    <form method="POST" action="/feedback" class="feedback">
+      <input type="hidden" name="section" value="calendar">
+      <button type="submit" name="rating" value="good" title="Helpful">👍</button>
+      <button type="submit" name="rating" value="bad" title="Needs improvement">👎</button>
+      <input type="text" name="note" placeholder="What should be different? (optional)" maxlength="300">
+    </form>
+    {{end}}
   </div>
   <details>
     <summary>Raw JSON</summary>
@@ -293,6 +315,62 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 }
 
+// feedbackContext returns a string summarising recent feedback for the given
+// section, to be appended to the system prompt so the LLM can self-correct.
+func (s *Server) feedbackContext(section string) string {
+	if s.store == nil {
+		return ""
+	}
+	entries, err := s.store.RecentFeedback(section, 5)
+	if err != nil || len(entries) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n\nRecent user feedback on your previous summaries (newest first):\n")
+	for _, f := range entries {
+		icon := "👍"
+		if f.Rating == "bad" {
+			icon = "👎"
+		}
+		if f.Note != "" {
+			fmt.Fprintf(&sb, "- %s %s\n", icon, f.Note)
+		} else {
+			fmt.Fprintf(&sb, "- %s (no additional comment)\n", icon)
+		}
+	}
+	sb.WriteString("Use this feedback to adjust your tone, length, and focus accordingly.")
+	return sb.String()
+}
+
+func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form data", http.StatusBadRequest)
+		return
+	}
+	section := r.FormValue("section")
+	rating := r.FormValue("rating")
+	note := strings.TrimSpace(r.FormValue("note"))
+
+	if section != "email" && section != "calendar" {
+		http.Error(w, "invalid section", http.StatusBadRequest)
+		return
+	}
+	if rating != "good" && rating != "bad" {
+		http.Error(w, "invalid rating", http.StatusBadRequest)
+		return
+	}
+	if s.store != nil {
+		if err := s.store.AddFeedback(section, rating, note); err != nil {
+			log.Printf("store add feedback: %v", err)
+		}
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -348,7 +426,7 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
 				Role:    "system",
-				Content: s.getPrompt("email", defaultEmailPrompt),
+				Content: s.getPrompt("email", defaultEmailPrompt) + s.feedbackContext("email"),
 			},
 			{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
 		})
@@ -380,7 +458,7 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
 				Role:    "system",
-				Content: s.getPrompt("calendar", defaultCalendarPrompt),
+				Content: s.getPrompt("calendar", defaultCalendarPrompt) + s.feedbackContext("calendar"),
 			},
 			{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
 		})
