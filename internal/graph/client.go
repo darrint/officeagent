@@ -4,9 +4,118 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 )
+
+// windowsToIANA maps Windows timezone names to IANA timezone identifiers.
+// Graph API returns Windows timezone names in event start/end objects.
+var windowsToIANA = map[string]string{
+	"Dateline Standard Time":        "Etc/GMT+12",
+	"UTC-11":                        "Etc/GMT+11",
+	"Hawaiian Standard Time":        "Pacific/Honolulu",
+	"Alaskan Standard Time":         "America/Anchorage",
+	"Pacific Standard Time":         "America/Los_Angeles",
+	"Mountain Standard Time":        "America/Denver",
+	"Mountain Standard Time (Mexico)": "America/Chihuahua",
+	"US Mountain Standard Time":     "America/Phoenix",
+	"Central Standard Time":         "America/Chicago",
+	"Central Standard Time (Mexico)": "America/Mexico_City",
+	"Canada Central Standard Time":  "America/Regina",
+	"Eastern Standard Time":         "America/New_York",
+	"US Eastern Standard Time":      "America/Indiana/Indianapolis",
+	"Atlantic Standard Time":        "America/Halifax",
+	"Newfoundland Standard Time":     "America/St_Johns",
+	"E. South America Standard Time": "America/Sao_Paulo",
+	"SA Eastern Standard Time":      "America/Cayenne",
+	"UTC-02":                        "Etc/GMT+2",
+	"Azores Standard Time":          "Atlantic/Azores",
+	"Cape Verde Standard Time":      "Atlantic/Cape_Verde",
+	"UTC":                           "UTC",
+	"GMT Standard Time":             "Europe/London",
+	"Greenwich Standard Time":       "Atlantic/Reykjavik",
+	"W. Europe Standard Time":       "Europe/Berlin",
+	"Central Europe Standard Time":  "Europe/Warsaw",
+	"Romance Standard Time":         "Europe/Paris",
+	"Central European Standard Time": "Europe/Warsaw",
+	"W. Central Africa Standard Time": "Africa/Lagos",
+	"Jordan Standard Time":          "Asia/Amman",
+	"GTB Standard Time":             "Europe/Bucharest",
+	"Middle East Standard Time":     "Asia/Beirut",
+	"Egypt Standard Time":           "Africa/Cairo",
+	"E. Europe Standard Time":       "Asia/Nicosia",
+	"FLE Standard Time":             "Europe/Kiev",
+	"Turkey Standard Time":          "Europe/Istanbul",
+	"Israel Standard Time":          "Asia/Jerusalem",
+	"Arabic Standard Time":          "Asia/Baghdad",
+	"Arab Standard Time":            "Asia/Riyadh",
+	"E. Africa Standard Time":       "Africa/Nairobi",
+	"Iran Standard Time":            "Asia/Tehran",
+	"Arabian Standard Time":         "Asia/Dubai",
+	"Azerbaijan Standard Time":      "Asia/Baku",
+	"Mauritius Standard Time":       "Indian/Mauritius",
+	"Caucasus Standard Time":        "Asia/Yerevan",
+	"Afghanistan Standard Time":     "Asia/Kabul",
+	"Pakistan Standard Time":        "Asia/Karachi",
+	"India Standard Time":           "Asia/Calcutta",
+	"Sri Lanka Standard Time":       "Asia/Colombo",
+	"Nepal Standard Time":           "Asia/Katmandu",
+	"Central Asia Standard Time":    "Asia/Almaty",
+	"Bangladesh Standard Time":      "Asia/Dhaka",
+	"Myanmar Standard Time":         "Asia/Rangoon",
+	"SE Asia Standard Time":         "Asia/Bangkok",
+	"China Standard Time":           "Asia/Shanghai",
+	"Singapore Standard Time":       "Asia/Singapore",
+	"W. Australia Standard Time":    "Australia/Perth",
+	"Taipei Standard Time":          "Asia/Taipei",
+	"Tokyo Standard Time":           "Asia/Tokyo",
+	"Korea Standard Time":           "Asia/Seoul",
+	"Cen. Australia Standard Time":  "Australia/Adelaide",
+	"AUS Central Standard Time":     "Australia/Darwin",
+	"E. Australia Standard Time":    "Australia/Brisbane",
+	"AUS Eastern Standard Time":     "Australia/Sydney",
+	"West Pacific Standard Time":    "Pacific/Port_Moresby",
+	"Tasmania Standard Time":        "Australia/Hobart",
+	"Magadan Standard Time":         "Asia/Magadan",
+	"Central Pacific Standard Time": "Pacific/Guadalcanal",
+	"New Zealand Standard Time":     "Pacific/Auckland",
+	"Fiji Standard Time":            "Pacific/Fiji",
+	"Tonga Standard Time":           "Pacific/Tongatapu",
+}
+
+// parseEventTime parses a Graph API event time string with its associated
+// Windows or IANA timezone name. Falls back to UTC if the timezone is unknown.
+func parseEventTime(dateStr, tzName string) time.Time {
+	loc := resolveLocation(tzName)
+	// Graph returns times without fractional seconds in some cases; try both formats.
+	for _, layout := range []string{"2006-01-02T15:04:05.0000000", "2006-01-02T15:04:05"} {
+		t, err := time.ParseInLocation(layout, dateStr, loc)
+		if err == nil {
+			return t
+		}
+	}
+	log.Printf("graph: failed to parse event time %q (tz %q), using zero time", dateStr, tzName)
+	return time.Time{}
+}
+
+// resolveLocation returns the *time.Location for tzName, trying IANA names
+// first, then the Windows-to-IANA map, then UTC.
+func resolveLocation(tzName string) *time.Location {
+	if tzName == "" {
+		return time.UTC
+	}
+	if loc, err := time.LoadLocation(tzName); err == nil {
+		return loc
+	}
+	if iana, ok := windowsToIANA[tzName]; ok {
+		if loc, err := time.LoadLocation(iana); err == nil {
+			return loc
+		}
+	}
+	log.Printf("graph: unknown timezone %q, falling back to UTC", tzName)
+	return time.UTC
+}
 
 const graphBase = "https://graph.microsoft.com/v1.0"
 
@@ -107,8 +216,8 @@ func (c *Client) ListEvents(ctx context.Context, top int) ([]Event, error) {
 	}
 	events := make([]Event, len(resp.Value))
 	for i, e := range resp.Value {
-		start, _ := time.Parse("2006-01-02T15:04:05.0000000", e.Start.DateTime)
-		end, _ := time.Parse("2006-01-02T15:04:05.0000000", e.End.DateTime)
+		start := parseEventTime(e.Start.DateTime, e.Start.TimeZone)
+		end := parseEventTime(e.End.DateTime, e.End.TimeZone)
 		events[i] = Event{
 			ID:      e.ID,
 			Subject: e.Subject,

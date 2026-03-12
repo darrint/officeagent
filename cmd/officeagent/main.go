@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	_ "time/tzdata" // embed IANA timezone database for Windows
 
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/graph"
