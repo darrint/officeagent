@@ -8,3 +8,7 @@
 
 # local dev secrets
 tokens.sh
+
+# build artifacts
+officeagent
+officeagent.exe
