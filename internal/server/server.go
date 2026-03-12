@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /login/status", s.handleLoginStatus)
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
+	s.mux.HandleFunc("GET /api/calendar/summary", s.handleCalendarSummary)
 	s.mux.HandleFunc("GET /api/llm/ping", s.handleLLMPing)
 }
 
@@ -193,6 +195,55 @@ func (s *Server) handleCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, events)
+}
+
+func (s *Server) handleCalendarSummary(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Error(w, "not authenticated — visit /login", http.StatusUnauthorized)
+		return
+	}
+	if s.llm == nil {
+		http.Error(w, "LLM not configured — set GITHUB_TOKEN", http.StatusServiceUnavailable)
+		return
+	}
+
+	events, err := s.client.ListEvents(r.Context(), 20)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list events: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Format events as plain text for the LLM prompt.
+	var sb strings.Builder
+	if len(events) == 0 {
+		sb.WriteString("No upcoming events.")
+	} else {
+		for _, e := range events {
+			fmt.Fprintf(&sb, "- %s: %s to %s\n",
+				e.Subject,
+				e.Start.Format("Mon Jan 2 3:04 PM"),
+				e.End.Format("3:04 PM"),
+			)
+		}
+	}
+
+	reply, err := s.llm.Chat(r.Context(), []llm.Message{
+		{
+			Role: "system",
+			Content: "You are a helpful executive assistant. " +
+				"Give the user a concise morning briefing of their upcoming calendar events. " +
+				"Be friendly but brief.",
+		},
+		{
+			Role:    "user",
+			Content: "Here are my upcoming calendar events:\n\n" + sb.String(),
+		},
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("llm chat: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"summary": reply})
 }
 
 func (s *Server) handleLLMPing(w http.ResponseWriter, r *http.Request) {
