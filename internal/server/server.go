@@ -94,9 +94,11 @@ body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2
 header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
 header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
 header span{font-size:.85rem;color:#666}
+.section{margin-bottom:1.5rem}
+.section-title{font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#888;margin-bottom:.5rem}
 .card{background:#fff;border-radius:10px;padding:1.75rem 2rem;box-shadow:0 1px 4px rgba(0,0,0,.08)}
 .card h2,.card h3{margin:1.2em 0 .4em;font-size:1.05rem;color:#0078d4}
-.card h2:first-child,.card h3:first-child{margin-top:0}
+.card h2:first-child,.card h3:first-child,.card p:first-child{margin-top:0}
 .card p{margin:.6em 0}
 .card ul,.card ol{margin:.6em 0 .6em 1.4em}
 .card li{margin:.25em 0}
@@ -117,12 +119,21 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 <div class="wrap">
   <header>
     <h1>officeagent</h1>
-    <span>calendar summary</span>
+    <span>morning briefing</span>
   </header>
-  {{if .Error}}
-  <div class="error">{{.Error}}</div>
+  {{if .FatalError}}
+  <div class="error">{{.FatalError}}</div>
   {{else}}
-  <div class="card">{{.Summary}}</div>
+  <div class="section">
+    <div class="section-title">Email</div>
+    {{if .Email.Error}}<div class="error">{{.Email.Error}}</div>
+    {{else}}<div class="card">{{.Email.HTML}}</div>{{end}}
+  </div>
+  <div class="section">
+    <div class="section-title">Calendar</div>
+    {{if .Calendar.Error}}<div class="error">{{.Calendar.Error}}</div>
+    {{else}}<div class="card">{{.Calendar.HTML}}</div>{{end}}
+  </div>
   <details>
     <summary>Raw JSON</summary>
     <pre>{{.RawJSON}}</pre>
@@ -132,10 +143,28 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 </body>
 </html>`))
 
-type summaryData struct {
-	Summary template.HTML
-	RawJSON string
-	Error   string
+type sectionData struct {
+	HTML template.HTML
+	Raw  string // raw LLM reply, for the JSON block
+	Error string
+}
+
+type pageData struct {
+	Email      sectionData
+	Calendar   sectionData
+	RawJSON    string
+	FatalError string
+}
+
+// renderMarkdown converts a markdown string to HTML. On error it falls back
+// to an escaped <pre> block.
+func renderMarkdown(md string) template.HTML {
+	var buf bytes.Buffer
+	if err := goldmark.Convert([]byte(md), &buf); err != nil {
+		log.Printf("goldmark: %v", err)
+		return template.HTML("<pre>" + template.HTMLEscapeString(md) + "</pre>") //nolint:gosec
+	}
+	return template.HTML(buf.String()) //nolint:gosec // goldmark output is safe HTML
 }
 
 func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
@@ -147,76 +176,112 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
+
+	servePage := func(data pageData) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := summaryTmpl.Execute(w, data); err != nil {
+			log.Printf("summary template: %v", err)
+		}
+	}
+
 	if s.llm == nil {
-		if err := summaryTmpl.Execute(w, summaryData{Error: "LLM not configured — set GITHUB_TOKEN"}); err != nil {
-			log.Printf("summary template: %v", err)
-		}
+		servePage(pageData{FatalError: "LLM not configured — set GITHUB_TOKEN"})
 		return
 	}
 
-	events, err := s.client.ListEvents(r.Context(), 20)
-	if err != nil {
-		if err := summaryTmpl.Execute(w, summaryData{Error: fmt.Sprintf("Failed to fetch calendar events: %v", err)}); err != nil {
-			log.Printf("summary template: %v", err)
-		}
-		return
+	// Fetch email and calendar data concurrently.
+	type emailResult struct {
+		section sectionData
+	}
+	type calResult struct {
+		section sectionData
 	}
 
-	var sb strings.Builder
-	if len(events) == 0 {
-		sb.WriteString("No upcoming events.")
-	} else {
-		for _, e := range events {
-			fmt.Fprintf(&sb, "- %s: %s to %s\n",
-				e.Subject,
-				e.Start.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-				e.End.In(easternLoc).Format("3:04 PM MST"),
-			)
-		}
-	}
+	emailCh := make(chan emailResult, 1)
+	calCh := make(chan calResult, 1)
 
-	reply, err := s.llm.Chat(r.Context(), []llm.Message{
-		{
-			Role: "system",
-			Content: "You are a helpful executive assistant. " +
-				"Give the user a concise morning briefing of their upcoming calendar events. " +
-				"Be friendly but brief.",
-		},
-		{
-			Role:    "user",
-			Content: "Here are my upcoming calendar events:\n\n" + sb.String(),
-		},
+	go func() {
+		msgs, err := s.client.ListMessages(r.Context(), 20)
+		if err != nil {
+			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}}
+			return
+		}
+		var sb strings.Builder
+		if len(msgs) == 0 {
+			sb.WriteString("No recent messages.")
+		} else {
+			for _, m := range msgs {
+				fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
+					m.From,
+					m.Subject,
+					m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+					m.BodyPreview,
+				)
+			}
+		}
+		reply, err := s.llm.Chat(r.Context(), []llm.Message{
+			{
+				Role: "system",
+				Content: "You are a helpful executive assistant. " +
+					"Give the user a concise summary of their recent inbox. " +
+					"Highlight anything urgent or requiring action. Be friendly but brief.",
+			},
+			{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
+		})
+		if err != nil {
+			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}}
+			return
+		}
+		emailCh <- emailResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
+	}()
+
+	go func() {
+		events, err := s.client.ListEvents(r.Context(), 20)
+		if err != nil {
+			calCh <- calResult{sectionData{Error: fmt.Sprintf("Failed to fetch calendar: %v", err)}}
+			return
+		}
+		var sb strings.Builder
+		if len(events) == 0 {
+			sb.WriteString("No upcoming events.")
+		} else {
+			for _, e := range events {
+				fmt.Fprintf(&sb, "- %s: %s to %s\n",
+					e.Subject,
+					e.Start.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+					e.End.In(easternLoc).Format("3:04 PM MST"),
+				)
+			}
+		}
+		reply, err := s.llm.Chat(r.Context(), []llm.Message{
+			{
+				Role: "system",
+				Content: "You are a helpful executive assistant. " +
+					"Give the user a concise morning briefing of their upcoming calendar events. " +
+					"Be friendly but brief.",
+			},
+			{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
+		})
+		if err != nil {
+			calCh <- calResult{sectionData{Error: fmt.Sprintf("LLM error (calendar): %v", err)}}
+			return
+		}
+		calCh <- calResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
+	}()
+
+	emailRes := <-emailCh
+	calRes := <-calCh
+
+	rawJSON, _ := json.MarshalIndent(map[string]string{
+		"email":    emailRes.section.Raw,
+		"calendar": calRes.section.Raw,
+	}, "", "  ")
+
+	servePage(pageData{
+		Email:    emailRes.section,
+		Calendar: calRes.section,
+		RawJSON:  string(rawJSON),
 	})
-	if err != nil {
-		if err := summaryTmpl.Execute(w, summaryData{Error: fmt.Sprintf("LLM error: %v", err)}); err != nil {
-			log.Printf("summary template: %v", err)
-		}
-		return
-	}
-
-	// Render markdown to HTML.
-	var mdBuf bytes.Buffer
-	if err := goldmark.Convert([]byte(reply), &mdBuf); err != nil {
-		log.Printf("goldmark: %v", err)
-		mdBuf.Reset()
-		// Fall back to plain text in a <pre>.
-		fmt.Fprintf(&mdBuf, "<pre>%s</pre>", template.HTMLEscapeString(reply))
-	}
-
-	// Build raw JSON for the details block.
-	rawJSON, err := json.MarshalIndent(map[string]string{"summary": reply}, "", "  ")
-	if err != nil {
-		rawJSON = []byte("{}")
-	}
-
-	data := summaryData{
-		Summary: template.HTML(mdBuf.String()), //nolint:gosec // goldmark output is safe HTML
-		RawJSON: string(rawJSON),
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := summaryTmpl.Execute(w, data); err != nil {
-		log.Printf("summary template: %v", err)
-	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
