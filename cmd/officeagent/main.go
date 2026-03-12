@@ -37,7 +37,7 @@ func main() {
 		log.Println("warning: GITHUB_TOKEN not set, LLM features disabled")
 	}
 
-	srv := server.New(cfg, auth, client, llmClient)
+	srv := server.New(cfg, auth, client, llmClient, st)
 	if err := srv.Run(); err != nil {
 		log.Fatal(err)
 	}

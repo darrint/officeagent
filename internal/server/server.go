@@ -14,7 +14,14 @@ import (
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
+	"github.com/darrint/officeagent/internal/store"
 	"github.com/yuin/goldmark"
+)
+
+// Default system prompts. Used when no custom prompt is stored.
+const (
+	defaultEmailPrompt    = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
+	defaultCalendarPrompt = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
 )
 
 // easternLoc is the America/New_York timezone, loaded once at startup.
@@ -42,19 +49,21 @@ type Server struct {
 	auth   *graph.Auth
 	client *graph.Client
 	llm    *llm.Client
+	store  *store.Store
 
 	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
 }
 
 // New creates a new Server with routes registered.
-func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client) *Server {
+func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, st *store.Store) *Server {
 	s := &Server{
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
 		auth:          auth,
 		client:        client,
 		llm:           llmClient,
+		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
 	}
 	s.routes()
@@ -67,6 +76,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /login/callback", s.handleLoginCallback)
 	s.mux.HandleFunc("GET /login/status", s.handleLoginStatus)
+	s.mux.HandleFunc("GET /settings", s.handleSettingsGet)
+	s.mux.HandleFunc("POST /settings", s.handleSettingsPost)
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
 	s.mux.HandleFunc("GET /api/calendar/summary", s.handleCalendarSummary)
@@ -93,7 +104,9 @@ body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2
 .wrap{max-width:720px;margin:0 auto}
 header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
 header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
-header span{font-size:.85rem;color:#666}
+header span{font-size:.85rem;color:#666;flex:1}
+header a{font-size:.82rem;color:#888;text-decoration:none}
+header a:hover{color:#0078d4}
 .section{margin-bottom:1.5rem}
 .section-title{font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#888;margin-bottom:.5rem}
 .card{background:#fff;border-radius:10px;padding:1.75rem 2rem;box-shadow:0 1px 4px rgba(0,0,0,.08)}
@@ -120,6 +133,7 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
   <header>
     <h1>officeagent</h1>
     <span>morning briefing</span>
+    <a href="/settings">Settings</a>
   </header>
   {{if .FatalError}}
   <div class="error">{{.FatalError}}</div>
@@ -165,6 +179,118 @@ func renderMarkdown(md string) template.HTML {
 		return template.HTML("<pre>" + template.HTMLEscapeString(md) + "</pre>") //nolint:gosec
 	}
 	return template.HTML(buf.String()) //nolint:gosec // goldmark output is safe HTML
+}
+
+// getPrompt returns the stored system prompt for key, or defaultVal if not set.
+func (s *Server) getPrompt(key, defaultVal string) string {
+	if s.store == nil {
+		return defaultVal
+	}
+	val, err := s.store.Get("prompt." + key)
+	if err != nil {
+		log.Printf("store get prompt.%s: %v", key, err)
+		return defaultVal
+	}
+	if val == "" {
+		return defaultVal
+	}
+	return val
+}
+
+var settingsTmpl = template.Must(template.New("settings").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>officeagent — Settings</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2rem 1rem;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
+header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
+header a{font-size:.82rem;color:#888;text-decoration:none}
+header a:hover{color:#0078d4}
+.card{background:#fff;border-radius:10px;padding:1.75rem 2rem;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:1.5rem}
+label{display:block;font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#555;margin-bottom:.5rem}
+textarea{width:100%;min-height:100px;padding:.75rem;font-family:system-ui,sans-serif;font-size:.9rem;line-height:1.5;border:1px solid #ddd;border-radius:6px;resize:vertical;color:#1a1a1a}
+textarea:focus{outline:none;border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,212,.15)}
+.hint{font-size:.78rem;color:#888;margin-top:.35rem}
+.actions{display:flex;gap:.75rem;align-items:center;margin-top:1.5rem}
+button{background:#0078d4;color:#fff;border:none;border-radius:6px;padding:.6rem 1.4rem;font-size:.9rem;font-weight:600;cursor:pointer}
+button:hover{background:#006cbd}
+.saved{color:#107c10;font-size:.88rem;font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>officeagent</h1>
+    <a href="/">← Morning briefing</a>
+  </header>
+  <form method="POST" action="/settings">
+    <div class="card">
+      <label for="email_prompt">Email summary prompt</label>
+      <textarea id="email_prompt" name="email_prompt" rows="4">{{.EmailPrompt}}</textarea>
+      <p class="hint">This system prompt is sent to the LLM when summarizing your inbox.</p>
+    </div>
+    <div class="card">
+      <label for="calendar_prompt">Calendar summary prompt</label>
+      <textarea id="calendar_prompt" name="calendar_prompt" rows="4">{{.CalendarPrompt}}</textarea>
+      <p class="hint">This system prompt is sent to the LLM when summarizing your calendar.</p>
+    </div>
+    <div class="actions">
+      <button type="submit">Save prompts</button>
+      {{if .Saved}}<span class="saved">&#10003; Saved</span>{{end}}
+    </div>
+  </form>
+</div>
+</body>
+</html>`))
+
+type settingsData struct {
+	EmailPrompt    string
+	CalendarPrompt string
+	Saved          bool
+}
+
+func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	data := settingsData{
+		EmailPrompt:    s.getPrompt("email", defaultEmailPrompt),
+		CalendarPrompt: s.getPrompt("calendar", defaultCalendarPrompt),
+		Saved:          r.URL.Query().Get("saved") == "1",
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := settingsTmpl.Execute(w, data); err != nil {
+		log.Printf("settings template: %v", err)
+	}
+}
+
+func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form data", http.StatusBadRequest)
+		return
+	}
+	emailPrompt := strings.TrimSpace(r.FormValue("email_prompt"))
+	calPrompt := strings.TrimSpace(r.FormValue("calendar_prompt"))
+
+	if s.store != nil {
+		if err := s.store.Set("prompt.email", emailPrompt); err != nil {
+			log.Printf("store set prompt.email: %v", err)
+		}
+		if err := s.store.Set("prompt.calendar", calPrompt); err != nil {
+			log.Printf("store set prompt.calendar: %v", err)
+		}
+	}
+	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 }
 
 func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
@@ -221,10 +347,8 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		}
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
-				Role: "system",
-				Content: "You are a helpful executive assistant. " +
-					"Give the user a concise summary of their recent inbox. " +
-					"Highlight anything urgent or requiring action. Be friendly but brief.",
+				Role:    "system",
+				Content: s.getPrompt("email", defaultEmailPrompt),
 			},
 			{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
 		})
@@ -255,10 +379,8 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		}
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
-				Role: "system",
-				Content: "You are a helpful executive assistant. " +
-					"Give the user a concise morning briefing of their upcoming calendar events. " +
-					"Be friendly but brief.",
+				Role:    "system",
+				Content: s.getPrompt("calendar", defaultCalendarPrompt),
 			},
 			{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
 		})
