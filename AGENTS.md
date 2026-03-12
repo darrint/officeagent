@@ -75,11 +75,11 @@ export OFFICEAGENT_LLM_MODEL=gpt-4o-mini
 | API | Base URL | Auth | Claude? |
 |-----|----------|------|---------|
 | GitHub Models | `models.inference.ai.azure.com` | PAT as Bearer | No |
-| GitHub Copilot | `api.githubcopilot.com` | OAuth token + token exchange | Yes |
+| GitHub Copilot | `api.githubcopilot.com` | OAuth token (copilot scope) as Bearer | Yes |
 
-Switching to the Copilot API requires a short-lived token exchange step
-(`POST api.github.com/copilot_internal/v2/token`). This is tracked as a
-separate task.
+The Copilot OAuth token works **directly** as a Bearer token against
+`api.githubcopilot.com` — **no token exchange step is required**.
+The app currently uses the Copilot API with `claude-sonnet-4.6` as default.
 
 ## Known gotchas
 
