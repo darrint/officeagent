@@ -202,16 +202,23 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 	return msgs, nil
 }
 
-// ListEvents returns upcoming calendar events.
+// ListEvents returns upcoming calendar events, including recurring event instances.
 func (c *Client) ListEvents(ctx context.Context, top int) ([]Event, error) {
 	var resp listResponse[graphEvent]
 	now := time.Now().UTC().Format(time.RFC3339)
-	path := fmt.Sprintf("/me/calendarview?startDateTime=%s&endDateTime=%s&$top=%d&$select=id,subject,start,end",
+	// Use $orderby=start/dateTime to guarantee chronological order and ensure
+	// recurring event instances are returned (not only series masters).
+	// Prefer: outlook.timezone="UTC" makes Graph interpret the window boundaries
+	// in UTC, matching our startDateTime/endDateTime values.
+	path := fmt.Sprintf(
+		"/me/calendarview?startDateTime=%s&endDateTime=%s&$top=%d&$orderby=start/dateTime&$select=id,subject,start,end",
 		now,
 		time.Now().UTC().Add(30*24*time.Hour).Format(time.RFC3339),
 		top,
 	)
-	if err := c.get(ctx, path, &resp); err != nil {
+	if err := c.get(ctx, path, &resp, map[string]string{
+		"Prefer": `outlook.timezone="UTC"`,
+	}); err != nil {
 		return nil, err
 	}
 	events := make([]Event, len(resp.Value))
@@ -229,8 +236,8 @@ func (c *Client) ListEvents(ctx context.Context, top int) ([]Event, error) {
 }
 
 // get performs an authenticated GET request to the Graph API and decodes the
-// JSON response into out.
-func (c *Client) get(ctx context.Context, path string, out interface{}) error {
+// JSON response into out. Optional extraHeaders maps are merged into the request.
+func (c *Client) get(ctx context.Context, path string, out interface{}, extraHeaders ...map[string]string) error {
 	tok, err := c.auth.Token(ctx)
 	if err != nil {
 		return fmt.Errorf("get token: %w", err)
@@ -241,6 +248,11 @@ func (c *Client) get(ctx context.Context, path string, out interface{}) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	req.Header.Set("Accept", "application/json")
+	for _, h := range extraHeaders {
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
