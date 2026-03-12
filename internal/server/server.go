@@ -11,6 +11,7 @@ import (
 
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/graph"
+	"github.com/darrint/officeagent/internal/llm"
 )
 
 // pendingLogin holds PKCE state for an in-flight authorization.
@@ -25,18 +26,20 @@ type Server struct {
 	mux    *http.ServeMux
 	auth   *graph.Auth
 	client *graph.Client
+	llm    *llm.Client
 
-	pendingMu    sync.Mutex
+	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
 }
 
 // New creates a new Server with routes registered.
-func New(cfg *config.Config, auth *graph.Auth, client *graph.Client) *Server {
+func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client) *Server {
 	s := &Server{
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
 		auth:          auth,
 		client:        client,
+		llm:           llmClient,
 		pendingLogins: make(map[string]pendingLogin),
 	}
 	s.routes()
@@ -50,6 +53,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /login/status", s.handleLoginStatus)
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
+	s.mux.HandleFunc("GET /api/llm/ping", s.handleLLMPing)
 }
 
 // Run starts the HTTP server and blocks until it returns an error.
@@ -189,6 +193,21 @@ func (s *Server) handleCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, events)
+}
+
+func (s *Server) handleLLMPing(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		http.Error(w, "LLM not configured — set GITHUB_TOKEN", http.StatusServiceUnavailable)
+		return
+	}
+	reply, err := s.llm.Chat(r.Context(), []llm.Message{
+		{Role: "user", Content: "Say hello in one sentence."},
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("llm chat: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"reply": reply})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

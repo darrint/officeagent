@@ -5,6 +5,7 @@ import (
 
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/graph"
+	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/server"
 	"github.com/darrint/officeagent/internal/store"
 )
@@ -28,7 +29,14 @@ func main() {
 	}, st)
 	client := graph.NewClient(auth)
 
-	srv := server.New(cfg, auth, client)
+	var llmClient *llm.Client
+	if cfg.GitHubToken != "" {
+		llmClient = llm.NewClient(cfg.GitHubToken, cfg.LLMModel)
+	} else {
+		log.Println("warning: GITHUB_TOKEN not set, LLM features disabled")
+	}
+
+	srv := server.New(cfg, auth, client, llmClient)
 	if err := srv.Run(); err != nil {
 		log.Fatal(err)
 	}

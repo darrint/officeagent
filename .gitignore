@@ -5,3 +5,6 @@
 
 # beads runtime artifacts
 .beads/*.pid.lock
+
+# local dev secrets
+tokens.sh

@@ -25,6 +25,16 @@ type Config struct {
 	// Set via OFFICEAGENT_REDIRECT_URI environment variable.
 	// Defaults to http://localhost:8080/login/callback.
 	RedirectURI string
+
+	// GitHubToken is a GitHub personal access token (or OAuth token) used to
+	// obtain a short-lived GitHub Copilot API token.
+	// Set via GITHUB_TOKEN environment variable.
+	GitHubToken string
+
+	// LLMModel is the model identifier passed to the LLM completions API.
+	// Set via OFFICEAGENT_LLM_MODEL environment variable.
+	// Defaults to gpt-4o-mini.
+	LLMModel string
 }
 
 // Default returns a Config populated with defaults and environment overrides.
@@ -37,11 +47,17 @@ func Default() *Config {
 	if redirectURI == "" {
 		redirectURI = "http://localhost:8080/login/callback"
 	}
+	llmModel := os.Getenv("OFFICEAGENT_LLM_MODEL")
+	if llmModel == "" {
+		llmModel = "gpt-4o-mini"
+	}
 	return &Config{
 		Addr:          "127.0.0.1:8080",
 		DBPath:        "officeagent.db",
 		AzureClientID: os.Getenv("OFFICEAGENT_CLIENT_ID"),
 		AzureTenantID: tenantID,
 		RedirectURI:   redirectURI,
+		GitHubToken:   os.Getenv("GITHUB_TOKEN"),
+		LLMModel:      llmModel,
 	}
 }
