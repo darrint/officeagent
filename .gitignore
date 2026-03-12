@@ -2,3 +2,6 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# beads runtime artifacts
+.beads/*.pid.lock
