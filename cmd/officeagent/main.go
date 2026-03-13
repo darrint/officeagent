@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	_ "time/tzdata" // embed IANA timezone database for Windows
 
@@ -55,7 +56,9 @@ func main() {
 		fmClient = fastmail.NewClient(v)
 	}
 
+	ctx := context.Background()
 	srv := server.New(cfg, auth, client, llmClient, ghClient, fmClient, st)
+	srv.StartScheduler(ctx)
 	if err := srv.Run(); err != nil {
 		log.Fatal(err)
 	}

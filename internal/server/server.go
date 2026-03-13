@@ -18,6 +18,7 @@ import (
 	github "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
+	"github.com/darrint/officeagent/internal/ntfy"
 	"github.com/darrint/officeagent/internal/store"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
@@ -253,6 +254,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings", s.handleSettingsPost)
 	s.mux.HandleFunc("POST /feedback", s.handleFeedback)
 	s.mux.HandleFunc("POST /archive-lowprio", s.handleArchiveLowPrio)
+	s.mux.HandleFunc("POST /send-report", s.handleSendReport)
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
 	s.mux.HandleFunc("GET /api/llm/ping", s.handleLLMPing)
@@ -352,6 +354,24 @@ function archiveLowPrio() {
       out.textContent = 'Error: ' + e;
     });
 }
+function sendReport() {
+  var btn = document.getElementById('send-report-btn');
+  var out = document.getElementById('archive-result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Sending\u2026';
+  fetch('/send-report', {method:'POST'})
+    .then(function(r){
+      if (!r.ok) return r.text().then(function(t){ throw new Error(t); });
+      btn.disabled = false;
+      btn.innerHTML = 'Send Now';
+      out.textContent = 'Report sent via ntfy.';
+    })
+    .catch(function(e){
+      btn.disabled = false;
+      btn.innerHTML = 'Send Now';
+      out.textContent = 'Send failed: ' + e;
+    });
+}
 </script>
 </head>
 <body>
@@ -370,6 +390,7 @@ function archiveLowPrio() {
     <span>Generated {{.GeneratedAt}}</span>
     <form method="POST" action="/generate"><button type="submit" onclick="startGenerate(this)">Regenerate</button></form>
     <button type="button" id="archive-btn" onclick="archiveLowPrio()">Move Low-Priority Mail</button>
+    <button type="button" id="send-report-btn" onclick="sendReport()" style="background:#107c10">Send Now</button>
   </div>
   <div id="archive-result" style="font-size:.82rem;color:#555;margin-bottom:.75rem;padding:0 1rem"></div>
   <div class="section">
@@ -650,6 +671,11 @@ button:hover{background:#006cbd}
       <input type="text" id="graph_lowprio_folder" name="graph_lowprio_folder" value="{{.GraphLowPrioFolder}}" placeholder="Low Priority">
       <p class="hint">Office 365 mail folder to move low-priority mail into when "Move Low-Priority Mail" is used.</p>
     </div>
+    <div class="card">
+      <label for="ntfy_topic">ntfy.sh topic (push notifications)</label>
+      <input type="password" id="ntfy_topic" name="ntfy_topic" autocomplete="new-password" value="{{.NtfyTopic}}" placeholder="your-secret-topic-name">
+      <p class="hint">Secret ntfy.sh topic name for 7 AM daily briefing push notifications. Leave blank to disable. Create a topic at <code>ntfy.sh</code> — keep it secret.</p>
+    </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
       {{if .Saved}}<span class="saved">&#10003; Saved</span>{{end}}
@@ -672,6 +698,7 @@ type settingsData struct {
 	AzureClientID          string // not a secret — can be shown in the UI
 	FastmailLowPrioFolder  string
 	GraphLowPrioFolder     string
+	NtfyTopic              string // stored as setting.ntfy_topic; shown as password input
 	Saved                  bool
 }
 
@@ -693,6 +720,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		AzureClientID:         s.effectiveAzureClientID(),
 		FastmailLowPrioFolder: s.getSetting("fastmail_lowprio_folder", "Low Priority"),
 		GraphLowPrioFolder:    s.getSetting("graph_lowprio_folder", "Low Priority"),
+		NtfyTopic:             s.getSetting("ntfy_topic", ""),
 		Saved:                 r.URL.Query().Get("saved") == "1",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -722,6 +750,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	azureClientID := strings.TrimSpace(r.FormValue("azure_client_id"))
 	fastmailLowPrioFolder := strings.TrimSpace(r.FormValue("fastmail_lowprio_folder"))
 	graphLowPrioFolder := strings.TrimSpace(r.FormValue("graph_lowprio_folder"))
+	ntfyTopic := strings.TrimSpace(r.FormValue("ntfy_topic"))
 
 	if s.store != nil {
 		if err := s.store.Set("prompt.overall", overallPrompt); err != nil {
@@ -775,6 +804,10 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			if err := s.store.Set("setting.graph_lowprio_folder", graphLowPrioFolder); err != nil {
 				log.Printf("store set setting.graph_lowprio_folder: %v", err)
 			}
+		}
+		// ntfy_topic is always saved (including empty string to clear it).
+		if err := s.store.Set("setting.ntfy_topic", ntfyTopic); err != nil {
+			log.Printf("store set setting.ntfy_topic: %v", err)
 		}
 	}
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
@@ -1122,19 +1155,16 @@ func (s *Server) saveLastReport(rep *cachedReport) error {
 	return s.store.Set(reportStoreKey, string(b))
 }
 
-func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
-	if !s.auth.IsAuthenticated(r.Context()) {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
-	}
+// GenerateBriefing fetches data from all configured sources, asks the LLM for
+// summaries of each section, saves the result to the store, and returns it.
+// It is safe to call from background goroutines (uses the supplied context).
+func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	llmC := s.getLLM()
 	ghC := s.getGHClient()
 	if llmC == nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
+		return nil, fmt.Errorf("LLM not configured")
 	}
 
-	// Fetch email, calendar, and GitHub data concurrently.
 	type emailResult struct{ section sectionData }
 	type calResult struct{ section sectionData }
 	type ghResult struct{ section sectionData }
@@ -1146,7 +1176,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	fmCh := make(chan fmResult, 1)
 
 	go func() {
-		msgs, err := s.client.ListMessages(r.Context(), 20)
+		msgs, err := s.client.ListMessages(ctx, 20)
 		if err != nil {
 			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}}
 			return
@@ -1164,7 +1194,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := llmC.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(ctx, []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -1182,7 +1212,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	go func() {
-		events, err := s.client.ListEvents(r.Context(), 20)
+		events, err := s.client.ListEvents(ctx, 20)
 		if err != nil {
 			calCh <- calResult{sectionData{Error: fmt.Sprintf("Failed to fetch calendar: %v", err)}}
 			return
@@ -1199,7 +1229,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := llmC.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(ctx, []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -1221,7 +1251,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 			ghCh <- ghResult{}
 			return
 		}
-		prs, err := ghC.ListRecentPRs(r.Context(), s.githubSince(), s.githubOrgs())
+		prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs())
 		if err != nil {
 			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}}
 			return
@@ -1242,7 +1272,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := llmC.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(ctx, []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -1265,7 +1295,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 			fmCh <- fmResult{}
 			return
 		}
-		msgs, err := fmC.ListMessages(r.Context(), 20)
+		msgs, err := fmC.ListMessages(ctx, 20)
 		if err != nil {
 			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}}
 			return
@@ -1283,7 +1313,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := llmC.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(ctx, []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -1319,8 +1349,120 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if err := s.saveLastReport(rep); err != nil {
 		log.Printf("save last report: %v", err)
 	}
+	return rep, nil
+}
 
+// briefingMarkdown formats a cachedReport as a Markdown document suitable for
+// sending via ntfy. Sections with errors are omitted.
+func briefingMarkdown(rep *cachedReport) string {
+	var sb strings.Builder
+	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
+	fmt.Fprintf(&sb, "# 7 AM Office Summary – %s\n\n", date)
+	if rep.EmailRaw != "" {
+		fmt.Fprintf(&sb, "## Work Email\n\n%s\n\n", rep.EmailRaw)
+	}
+	if rep.CalendarRaw != "" {
+		fmt.Fprintf(&sb, "## Calendar\n\n%s\n\n", rep.CalendarRaw)
+	}
+	if rep.GitHubRaw != "" {
+		fmt.Fprintf(&sb, "## GitHub PRs\n\n%s\n\n", rep.GitHubRaw)
+	}
+	if rep.FastmailRaw != "" {
+		fmt.Fprintf(&sb, "## Personal Email\n\n%s\n\n", rep.FastmailRaw)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// sendNtfyReport generates a fresh briefing and sends it to ntfy if a topic is
+// configured. Returns an error if the topic is not set or any step fails.
+func (s *Server) sendNtfyReport(ctx context.Context) error {
+	topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
+	if topic == "" {
+		return fmt.Errorf("ntfy topic not configured")
+	}
+	rep, err := s.GenerateBriefing(ctx)
+	if err != nil {
+		return fmt.Errorf("generate briefing: %w", err)
+	}
+	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
+	title := "7 AM Office Update – " + date
+	body := briefingMarkdown(rep)
+	return ntfy.Send(ctx, topic, title, body)
+}
+
+// StartScheduler launches a background goroutine that wakes at 7:00 AM local
+// time each day, generates a briefing, and sends it via ntfy.sh. It returns
+// immediately; the goroutine runs until ctx is cancelled.
+func (s *Server) StartScheduler(ctx context.Context) {
+	go func() {
+		for {
+			next := nextSevenAM(time.Now().In(easternLoc))
+			timer := time.NewTimer(time.Until(next))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
+			if topic == "" {
+				log.Println("scheduler: ntfy topic not configured, skipping send")
+				continue
+			}
+			log.Println("scheduler: sending 7 AM briefing via ntfy")
+			if err := s.sendNtfyReport(ctx); err != nil {
+				log.Printf("scheduler: ntfy send failed: %v", err)
+			} else {
+				log.Println("scheduler: ntfy send succeeded")
+			}
+		}
+	}()
+}
+
+// nextSevenAM returns the next 7:00 AM occurrence in the given local time.
+// If now is before 7:15 AM today, it returns today at 7:00 AM; otherwise
+// it returns tomorrow at 7:00 AM.
+func nextSevenAM(now time.Time) time.Time {
+	y, mo, d := now.Date()
+	loc := now.Location()
+	today7 := time.Date(y, mo, d, 7, 0, 0, 0, loc)
+	// If current time is within the 7:00–7:15 window or before, use today.
+	if now.Before(today7.Add(15 * time.Minute)) {
+		if now.Before(today7) {
+			return today7
+		}
+		return today7 // still within window — fire immediately on next tick
+	}
+	// Already past 7:15 AM — target tomorrow.
+	return today7.AddDate(0, 0, 1)
+}
+
+func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if s.getLLM() == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if _, err := s.GenerateBriefing(r.Context()); err != nil {
+		log.Printf("handleGenerate: %v", err)
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// handleSendReport handles POST /send-report — triggers an immediate ntfy send.
+func (s *Server) handleSendReport(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	if err := s.sendNtfyReport(r.Context()); err != nil {
+		http.Error(w, fmt.Sprintf("send report: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "sent"})
 }
 
 // --- connect page ---
