@@ -12,7 +12,7 @@ import (
 
 const (
 	baseURL         = "https://ntfy.sh"
-	maxMessageBytes = 2000 // conservative limit; ntfy.sh converts large bodies to file attachments
+	maxMessageBytes = 3800 // conservative limit; ntfy.sh converts large bodies to file attachments
 )
 
 // Send posts a Markdown-formatted message to the ntfy.sh topic.
