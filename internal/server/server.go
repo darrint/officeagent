@@ -673,7 +673,7 @@ button:hover{background:#006cbd}
     </div>
     <div class="card">
       <label for="ntfy_topic">ntfy.sh topic (push notifications)</label>
-      <input type="password" id="ntfy_topic" name="ntfy_topic" autocomplete="new-password" value="{{.NtfyTopic}}" placeholder="your-secret-topic-name">
+      <input type="text" id="ntfy_topic" name="ntfy_topic" value="{{.NtfyTopic}}" placeholder="your-secret-topic-name">
       <p class="hint">Secret ntfy.sh topic name for 7 AM daily briefing push notifications. Leave blank to disable. Create a topic at <code>ntfy.sh</code> — keep it secret.</p>
     </div>
     <div class="actions">
