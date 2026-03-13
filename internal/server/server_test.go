@@ -431,3 +431,36 @@ func TestHandleDoctor_llmFail(t *testing.T) {
 		t.Errorf("expected error detail in body, got:\n%s", body)
 	}
 }
+
+// --- buildSystemPrompt ---
+
+func TestBuildSystemPrompt_noOverall(t *testing.T) {
+	got := buildSystemPrompt("", "be brief")
+	if got != "be brief" {
+		t.Errorf("expected specific prompt unchanged, got %q", got)
+	}
+}
+
+func TestBuildSystemPrompt_withOverall(t *testing.T) {
+	got := buildSystemPrompt("always respond in French", "be brief")
+	want := "always respond in French\n\nbe brief"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildSystemPrompt_overallOnly(t *testing.T) {
+	// Specific prompt can be empty (degenerate case; should still work).
+	got := buildSystemPrompt("global rule", "")
+	want := "global rule\n\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildSystemPrompt_bothEmpty(t *testing.T) {
+	got := buildSystemPrompt("", "")
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+}

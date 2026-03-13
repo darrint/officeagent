@@ -42,9 +42,20 @@ type llmService interface {
 
 // Default system prompts. Used when no custom prompt is stored.
 const (
+	defaultOverallPrompt  = ""
 	defaultEmailPrompt    = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
 	defaultCalendarPrompt = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
 )
+
+// buildSystemPrompt assembles the final system prompt sent to the LLM.
+// If overall is non-empty it is prepended to specific, separated by a blank
+// line, acting as a global instruction prefix for every section prompt.
+func buildSystemPrompt(overall, specific string) string {
+	if overall == "" {
+		return specific
+	}
+	return overall + "\n\n" + specific
+}
 
 // easternLoc is the America/New_York timezone, loaded once at startup.
 // Falls back to UTC if the IANA database is unavailable (shouldn't happen
@@ -285,6 +296,11 @@ button:hover{background:#006cbd}
   </header>
   <form method="POST" action="/settings">
     <div class="card">
+      <label for="overall_prompt">Overall prompt prefix</label>
+      <textarea id="overall_prompt" name="overall_prompt" rows="4">{{.OverallPrompt}}</textarea>
+      <p class="hint">This text is prepended to every section prompt. Use it to set tone, persona, or standing instructions that apply to all summaries.</p>
+    </div>
+    <div class="card">
       <label for="email_prompt">Email summary prompt</label>
       <textarea id="email_prompt" name="email_prompt" rows="4">{{.EmailPrompt}}</textarea>
       <p class="hint">This system prompt is sent to the LLM when summarizing your inbox.</p>
@@ -304,6 +320,7 @@ button:hover{background:#006cbd}
 </html>`))
 
 type settingsData struct {
+	OverallPrompt  string
 	EmailPrompt    string
 	CalendarPrompt string
 	Saved          bool
@@ -315,6 +332,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := settingsData{
+		OverallPrompt:  s.getPrompt("overall", defaultOverallPrompt),
 		EmailPrompt:    s.getPrompt("email", defaultEmailPrompt),
 		CalendarPrompt: s.getPrompt("calendar", defaultCalendarPrompt),
 		Saved:          r.URL.Query().Get("saved") == "1",
@@ -336,8 +354,12 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	emailPrompt := strings.TrimSpace(r.FormValue("email_prompt"))
 	calPrompt := strings.TrimSpace(r.FormValue("calendar_prompt"))
+	overallPrompt := strings.TrimSpace(r.FormValue("overall_prompt"))
 
 	if s.store != nil {
+		if err := s.store.Set("prompt.overall", overallPrompt); err != nil {
+			log.Printf("store set prompt.overall: %v", err)
+		}
 		if err := s.store.Set("prompt.email", emailPrompt); err != nil {
 			log.Printf("store set prompt.email: %v", err)
 		}
@@ -459,7 +481,10 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
 				Role:    "system",
-				Content: s.getPrompt("email", defaultEmailPrompt) + s.feedbackContext("email"),
+				Content: buildSystemPrompt(
+					s.getPrompt("overall", defaultOverallPrompt),
+					s.getPrompt("email", defaultEmailPrompt)+s.feedbackContext("email"),
+				),
 			},
 			{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
 		})
@@ -491,7 +516,10 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
 				Role:    "system",
-				Content: s.getPrompt("calendar", defaultCalendarPrompt) + s.feedbackContext("calendar"),
+				Content: buildSystemPrompt(
+					s.getPrompt("overall", defaultOverallPrompt),
+					s.getPrompt("calendar", defaultCalendarPrompt)+s.feedbackContext("calendar"),
+				),
 			},
 			{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
 		})
