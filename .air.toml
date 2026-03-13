@@ -1,0 +1,33 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/officeagent ./cmd/officeagent/"
+  bin = "./tmp/officeagent"
+  full_bin = "./tmp/officeagent"
+  include_ext = ["go"]
+  exclude_dir = ["tmp", ".git", ".beads", ".dolt"]
+  exclude_file = []
+  exclude_regex = ["_test\\.go$"]
+  exclude_unchanged = true
+  follow_symlinks = false
+  delay = 500
+  kill_delay = "500ms"
+  send_interrupt = true
+  stop_on_error = true
+  rerun = false
+  rerun_delay = 500
+  log = "build-errors.log"
+
+[log]
+  time = false
+  main_only = false
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  clean_on_exit = true

@@ -59,6 +59,7 @@
               dolt
               bd
               gh
+              air
             ];
             shellHook = ''
               echo "officeagent development shell"

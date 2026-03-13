@@ -12,3 +12,6 @@ tokens.sh
 # build artifacts
 /officeagent
 /officeagent.exe
+
+# air live-reload artifacts
+tmp/
