@@ -93,8 +93,62 @@ type Server struct {
 	ghClient githubService
 	store    *store.Store
 
+	clientMu      sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
+}
+
+// getLLM returns the current LLM client, safe for concurrent use.
+func (s *Server) getLLM() llmService {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
+	return s.llm
+}
+
+// getGHClient returns the current GitHub client, safe for concurrent use.
+func (s *Server) getGHClient() githubService {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
+	return s.ghClient
+}
+
+// effectiveGitHubToken returns the GitHub token to use: store value takes
+// precedence over the env-var value in cfg so the Settings page is the
+// authoritative source.
+func (s *Server) effectiveGitHubToken() string {
+	if s.store != nil {
+		if v, err := s.store.Get("setting.github_token"); err == nil && v != "" {
+			return v
+		}
+	}
+	return s.cfg.GitHubToken
+}
+
+// effectiveAzureClientID returns the Azure client ID from the store if set,
+// otherwise falls back to the value loaded from the env var at startup.
+func (s *Server) effectiveAzureClientID() string {
+	if s.store != nil {
+		if v, err := s.store.Get("setting.azure_client_id"); err == nil && v != "" {
+			return v
+		}
+	}
+	return s.cfg.AzureClientID
+}
+
+// reinitClients rebuilds the LLM and GitHub clients using the current effective
+// GitHub token. Called after the token is updated via the Settings page so that
+// new API calls use the updated credentials without requiring a server restart.
+func (s *Server) reinitClients() {
+	tok := s.effectiveGitHubToken()
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	if tok != "" {
+		s.llm = llm.NewClient(tok, s.cfg.LLMModel)
+		s.ghClient = github.NewClient(tok)
+	} else {
+		s.llm = nil
+		s.ghClient = nil
+	}
 }
 
 // New creates a new Server with routes registered.
@@ -393,6 +447,9 @@ header a:hover{color:#0078d4}
 label{display:block;font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#555;margin-bottom:.5rem}
 textarea{width:100%;min-height:100px;padding:.75rem;font-family:system-ui,sans-serif;font-size:.9rem;line-height:1.5;border:1px solid #ddd;border-radius:6px;resize:vertical;color:#1a1a1a}
 textarea:focus{outline:none;border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,212,.15)}
+input[type=text],input[type=password]{width:100%;padding:.75rem;font-family:system-ui,sans-serif;font-size:.9rem;border:1px solid #ddd;border-radius:6px;color:#1a1a1a}
+input[type=text]:focus,input[type=password]:focus{outline:none;border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,212,.15)}
+.token-set{display:inline-block;background:#dff6dd;color:#107c10;border-radius:4px;padding:.15rem .5rem;font-size:.78rem;font-weight:600;margin-left:.5rem}
 .hint{font-size:.78rem;color:#888;margin-top:.35rem}
 .actions{display:flex;gap:.75rem;align-items:center;margin-top:1.5rem}
 button{background:#0078d4;color:#fff;border:none;border-radius:6px;padding:.6rem 1.4rem;font-size:.9rem;font-weight:600;cursor:pointer}
@@ -437,6 +494,16 @@ button:hover{background:#006cbd}
       <textarea id="github_orgs" name="github_orgs" rows="2">{{.GitHubOrgs}}</textarea>
       <p class="hint">Comma-separated list of GitHub org names to filter PRs by. Leave blank to search all accessible repos.</p>
     </div>
+    <div class="card">
+      <label for="github_token">GitHub token{{if .GitHubTokenSet}}<span class="token-set">&#10003; Token is set</span>{{end}}</label>
+      <input type="password" id="github_token" name="github_token" autocomplete="new-password" placeholder="Leave blank to keep existing token">
+      <p class="hint">GitHub OAuth token with <code>copilot</code> scope, used for LLM and GitHub PR features. Run <code>gh auth login --scopes copilot</code> then <code>gh auth token</code> to obtain one. Never echoed back to the browser.</p>
+    </div>
+    <div class="card">
+      <label for="azure_client_id">Azure application (client) ID</label>
+      <input type="text" id="azure_client_id" name="azure_client_id" value="{{.AzureClientID}}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+      <p class="hint">Azure AD app client ID used for Microsoft Graph OAuth. Register the app in Azure Portal under "Mobile and desktop applications" with redirect URI <code>http://localhost:8080/login/callback</code>.</p>
+    </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
       {{if .Saved}}<span class="saved">&#10003; Saved</span>{{end}}
@@ -453,6 +520,8 @@ type settingsData struct {
 	GitHubPrompt       string
 	GitHubLookbackDays string
 	GitHubOrgs         string
+	GitHubTokenSet     bool   // true if a GitHub token is stored (never echo the value)
+	AzureClientID      string // not a secret — can be shown in the UI
 	Saved              bool
 }
 
@@ -468,6 +537,8 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		GitHubPrompt:       s.getPrompt("github", defaultGitHubPrompt),
 		GitHubLookbackDays: s.getSetting("github.lookback_days", "0"),
 		GitHubOrgs:         s.getSetting("github.orgs", ""),
+		GitHubTokenSet:     s.effectiveGitHubToken() != "",
+		AzureClientID:      s.effectiveAzureClientID(),
 		Saved:              r.URL.Query().Get("saved") == "1",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -491,6 +562,8 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	githubPrompt := strings.TrimSpace(r.FormValue("github_prompt"))
 	githubLookback := strings.TrimSpace(r.FormValue("github_lookback_days"))
 	githubOrgs := strings.TrimSpace(r.FormValue("github_orgs"))
+	githubToken := strings.TrimSpace(r.FormValue("github_token"))
+	azureClientID := strings.TrimSpace(r.FormValue("azure_client_id"))
 
 	if s.store != nil {
 		if err := s.store.Set("prompt.overall", overallPrompt); err != nil {
@@ -510,6 +583,20 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.store.Set("setting.github.orgs", githubOrgs); err != nil {
 			log.Printf("store set setting.github.orgs: %v", err)
+		}
+		// Only update the GitHub token if a non-empty value was submitted.
+		// An empty submission means "keep existing token".
+		if githubToken != "" {
+			if err := s.store.Set("setting.github_token", githubToken); err != nil {
+				log.Printf("store set setting.github_token: %v", err)
+			}
+			// Rebuild LLM / GitHub clients immediately with the new token.
+			s.reinitClients()
+		}
+		if azureClientID != "" {
+			if err := s.store.Set("setting.azure_client_id", azureClientID); err != nil {
+				log.Printf("store set setting.azure_client_id: %v", err)
+			}
 		}
 	}
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
@@ -588,7 +675,7 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if s.llm == nil {
+	if s.getLLM() == nil {
 		servePage(pageData{FatalError: "LLM not configured — set GITHUB_TOKEN"})
 		return
 	}
@@ -681,7 +768,9 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
-	if s.llm == nil {
+	llmC := s.getLLM()
+	ghC := s.getGHClient()
+	if llmC == nil {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -714,7 +803,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := s.llm.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(r.Context(), []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -749,7 +838,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := s.llm.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(r.Context(), []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -767,11 +856,11 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	go func() {
-		if s.ghClient == nil {
+		if ghC == nil {
 			ghCh <- ghResult{}
 			return
 		}
-		prs, err := s.ghClient.ListRecentPRs(r.Context(), s.githubSince(), s.githubOrgs())
+		prs, err := ghC.ListRecentPRs(r.Context(), s.githubSince(), s.githubOrgs())
 		if err != nil {
 			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}}
 			return
@@ -792,7 +881,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
-		reply, err := s.llm.Chat(r.Context(), []llm.Message{
+		reply, err := llmC.Chat(r.Context(), []llm.Message{
 			{
 				Role: "system",
 				Content: buildSystemPrompt(
@@ -865,7 +954,7 @@ type loginData struct {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.AzureClientID == "" {
+	if s.effectiveAzureClientID() == "" {
 		if err := loginTmpl.Execute(w, loginData{ClientIDMissing: true}); err != nil {
 			log.Printf("login template: %v", err)
 		}
@@ -961,11 +1050,12 @@ func (s *Server) handleCalendar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLLMPing(w http.ResponseWriter, r *http.Request) {
-	if s.llm == nil {
+	llmC := s.getLLM()
+	if llmC == nil {
 		http.Error(w, "LLM not configured — set GITHUB_TOKEN", http.StatusServiceUnavailable)
 		return
 	}
-	reply, err := s.llm.Chat(r.Context(), []llm.Message{
+	reply, err := llmC.Chat(r.Context(), []llm.Message{
 		{Role: "user", Content: "Say hello in one sentence."},
 	})
 	if err != nil {
@@ -1147,13 +1237,14 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		cr := checkResult{Name: "LLM (GitHub Copilot)"}
 		start := time.Now()
-		if s.llm == nil {
+		llmC := s.getLLM()
+		if llmC == nil {
 			cr.Detail = "not configured — set GITHUB_TOKEN"
 			cr.Latency = time.Since(start)
 			ch <- result{3, cr}
 			return
 		}
-		_, err := s.llm.Chat(ctx, []llm.Message{
+		_, err := llmC.Chat(ctx, []llm.Message{
 			{Role: "user", Content: "Respond with exactly the word: pong"},
 		})
 		cr.Latency = time.Since(start)

@@ -25,6 +25,15 @@ func main() {
 		}
 	}()
 
+	// Prefer stored tokens over env-var values so the Settings page is the
+	// authoritative source.  Env vars still work as a dev fallback.
+	if v, err := st.Get("setting.github_token"); err == nil && v != "" {
+		cfg.GitHubToken = v
+	}
+	if v, err := st.Get("setting.azure_client_id"); err == nil && v != "" {
+		cfg.AzureClientID = v
+	}
+
 	auth := graph.NewAuth(graph.AuthConfig{
 		ClientID: cfg.AzureClientID,
 		TenantID: cfg.AzureTenantID,
@@ -37,7 +46,7 @@ func main() {
 		llmClient = llm.NewClient(cfg.GitHubToken, cfg.LLMModel)
 		ghClient = github.NewClient(cfg.GitHubToken)
 	} else {
-		log.Println("warning: GITHUB_TOKEN not set, LLM features disabled")
+		log.Println("warning: GITHUB_TOKEN not set and no token in settings — LLM features disabled; add token via Settings page")
 	}
 
 	srv := server.New(cfg, auth, client, llmClient, ghClient, st)

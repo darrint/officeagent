@@ -17,6 +17,7 @@ const tokenStoreKey = "graph_oauth_token"
 // AuthConfig holds the Azure AD application credentials.
 type AuthConfig struct {
 	// ClientID is the Azure AD app registration client ID.
+	// If empty, Auth will read "setting.azure_client_id" from the store.
 	ClientID string
 	// TenantID is the Azure AD tenant ("common" for multi-tenant).
 	TenantID string
@@ -26,7 +27,6 @@ type AuthConfig struct {
 type Auth struct {
 	cfg   AuthConfig
 	store *store.Store
-	oc    *oauth2.Config
 }
 
 // graphScopes are the Microsoft Graph permissions we request.
@@ -38,18 +38,32 @@ var graphScopes = []string{
 
 // NewAuth creates an Auth from config and a token store.
 func NewAuth(cfg AuthConfig, s *store.Store) *Auth {
-	endpoint := oauth2.Endpoint{
-		AuthURL:   fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", cfg.TenantID),
-		TokenURL:  fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", cfg.TenantID),
-		AuthStyle: oauth2.AuthStyleInParams,
+	return &Auth{cfg: cfg, store: s}
+}
+
+// effectiveClientID returns the Azure AD client ID to use. It prefers the
+// value stored in "setting.azure_client_id" (set via the Settings page) and
+// falls back to the value supplied at construction time (env var).
+func (a *Auth) effectiveClientID() string {
+	if a.store != nil {
+		if v, err := a.store.Get("setting.azure_client_id"); err == nil && v != "" {
+			return v
+		}
 	}
-	return &Auth{
-		cfg:   cfg,
-		store: s,
-		oc: &oauth2.Config{
-			ClientID: cfg.ClientID,
-			Scopes:   graphScopes,
-			Endpoint: endpoint,
+	return a.cfg.ClientID
+}
+
+// oauthConfig builds an oauth2.Config using the current effective client ID.
+// Called on every OAuth operation so that a Settings-page update takes effect
+// without restarting the server.
+func (a *Auth) oauthConfig() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID: a.effectiveClientID(),
+		Scopes:   graphScopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", a.cfg.TenantID),
+			TokenURL:  fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.cfg.TenantID),
+			AuthStyle: oauth2.AuthStyleInParams,
 		},
 	}
 }
@@ -66,7 +80,7 @@ func (a *Auth) AuthCodeURL(redirectURI string) (authURL, state, verifier string,
 
 	verifier = oauth2.GenerateVerifier()
 
-	authURL = a.oc.AuthCodeURL(
+	authURL = a.oauthConfig().AuthCodeURL(
 		state,
 		oauth2.S256ChallengeOption(verifier),
 		oauth2.SetAuthURLParam("redirect_uri", redirectURI),
@@ -77,7 +91,7 @@ func (a *Auth) AuthCodeURL(redirectURI string) (authURL, state, verifier string,
 // ExchangeCode exchanges an authorization code (plus PKCE verifier) for a
 // token, persists it, and returns it.
 func (a *Auth) ExchangeCode(ctx context.Context, code, verifier, redirectURI string) (*oauth2.Token, error) {
-	tok, err := a.oc.Exchange(ctx, code,
+	tok, err := a.oauthConfig().Exchange(ctx, code,
 		oauth2.VerifierOption(verifier),
 		oauth2.SetAuthURLParam("redirect_uri", redirectURI),
 	)
@@ -101,7 +115,7 @@ func (a *Auth) Token(ctx context.Context) (*oauth2.Token, error) {
 		return nil, fmt.Errorf("not authenticated")
 	}
 	// Let the oauth2 library refresh if needed.
-	ts := a.oc.TokenSource(ctx, tok)
+	ts := a.oauthConfig().TokenSource(ctx, tok)
 	fresh, err := ts.Token()
 	if err != nil {
 		return nil, fmt.Errorf("refresh token: %w", err)
