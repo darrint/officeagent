@@ -7,17 +7,23 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
-const baseURL = "https://ntfy.sh"
+const (
+	baseURL         = "https://ntfy.sh"
+	maxMessageBytes = 4096 // ntfy.sh converts bodies larger than this to file attachments
+)
 
 // Send posts a Markdown-formatted message to the ntfy.sh topic.
 // title is shown as the notification title.
-// body is the Markdown message body.
+// body is the Markdown message body; it is silently truncated to 4096 bytes
+// (ntfy's limit) with a trailing indicator if it exceeds that.
 func Send(ctx context.Context, topic, title, body string) error {
 	if topic == "" {
 		return fmt.Errorf("ntfy: topic is empty")
 	}
+	body = truncateToLimit(body, maxMessageBytes)
 	url := baseURL + "/" + topic
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
@@ -39,4 +45,23 @@ func Send(ctx context.Context, topic, title, body string) error {
 		return fmt.Errorf("ntfy: unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
+}
+
+// truncateToLimit truncates s to at most maxBytes bytes, cutting at a valid
+// UTF-8 boundary and appending "\n\n…(truncated)" if truncation occurs.
+func truncateToLimit(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	suffix := "\n\n…(truncated)"
+	cutAt := maxBytes - len(suffix)
+	if cutAt < 0 {
+		cutAt = 0
+	}
+	b := []byte(s)[:cutAt]
+	// Walk back to the nearest valid UTF-8 boundary.
+	for len(b) > 0 && !utf8.Valid(b) {
+		b = b[:len(b)-1]
+	}
+	return string(b) + suffix
 }
