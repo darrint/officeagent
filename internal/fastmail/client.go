@@ -37,6 +37,7 @@ func NewClient(token string) *Client {
 
 // Message is a simplified mail message returned by ListMessages.
 type Message struct {
+	ID          string
 	From        string
 	Subject     string
 	ReceivedAt  time.Time
@@ -189,7 +190,7 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 					"path":     "/ids",
 					"resultOf": "0",
 				},
-				"properties": []string{"from", "subject", "receivedAt", "preview"},
+				"properties": []string{"id", "from", "subject", "receivedAt", "preview"},
 			},
 			"1",
 		},
@@ -208,6 +209,7 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 	}
 	var emailGetArgs struct {
 		List []struct {
+			ID         string    `json:"id"`
 			Subject    string    `json:"subject"`
 			Preview    string    `json:"preview"`
 			ReceivedAt time.Time `json:"receivedAt"`
@@ -232,6 +234,7 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 			}
 		}
 		msgs = append(msgs, Message{
+			ID:          e.ID,
 			From:        from,
 			Subject:     e.Subject,
 			ReceivedAt:  e.ReceivedAt,
@@ -239,4 +242,144 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 		})
 	}
 	return msgs, nil
+}
+
+// GetOrCreateMailbox returns the JMAP ID of the mailbox with the given name,
+// creating it if it does not exist.
+func (c *Client) GetOrCreateMailbox(ctx context.Context, name string) (string, error) {
+	sess, err := c.getSession(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	accountID := sess.PrimaryAccounts[mailCap]
+	if accountID == "" {
+		return "", fmt.Errorf("no mail account in session")
+	}
+
+	// Query for an existing mailbox with this name.
+	resps, err := c.jmapCall(ctx, sess.APIURL, []interface{}{
+		[]interface{}{
+			"Mailbox/query",
+			map[string]interface{}{
+				"accountId": accountID,
+				"filter":    map[string]interface{}{"name": name},
+			},
+			"0",
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("mailbox/query: %w", err)
+	}
+	if len(resps) > 0 {
+		var tuple []json.RawMessage
+		if err := json.Unmarshal(resps[0], &tuple); err == nil && len(tuple) >= 2 {
+			var args struct {
+				IDs []string `json:"ids"`
+			}
+			if err := json.Unmarshal(tuple[1], &args); err == nil && len(args.IDs) > 0 {
+				return args.IDs[0], nil
+			}
+		}
+	}
+
+	// Not found — create it.
+	resps, err = c.jmapCall(ctx, sess.APIURL, []interface{}{
+		[]interface{}{
+			"Mailbox/set",
+			map[string]interface{}{
+				"accountId": accountID,
+				"create": map[string]interface{}{
+					"new": map[string]interface{}{"name": name},
+				},
+			},
+			"0",
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("mailbox/set create: %w", err)
+	}
+	if len(resps) == 0 {
+		return "", fmt.Errorf("mailbox/set: no response")
+	}
+	var tuple []json.RawMessage
+	if err := json.Unmarshal(resps[0], &tuple); err != nil || len(tuple) < 2 {
+		return "", fmt.Errorf("malformed Mailbox/set response")
+	}
+	var setArgs struct {
+		Created map[string]struct {
+			ID string `json:"id"`
+		} `json:"created"`
+		NotCreated map[string]struct {
+			Description string `json:"description"`
+		} `json:"notCreated"`
+	}
+	if err := json.Unmarshal(tuple[1], &setArgs); err != nil {
+		return "", fmt.Errorf("decode Mailbox/set args: %w", err)
+	}
+	if entry, ok := setArgs.Created["new"]; ok && entry.ID != "" {
+		return entry.ID, nil
+	}
+	if entry, ok := setArgs.NotCreated["new"]; ok {
+		return "", fmt.Errorf("mailbox/set notCreated: %s", entry.Description)
+	}
+	return "", fmt.Errorf("mailbox/set: created entry missing id")
+}
+
+// MoveMessages moves the given message IDs to the target mailbox, replacing
+// their current mailbox associations. A single Email/set call is used.
+func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, targetMailboxID string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	sess, err := c.getSession(ctx)
+	if err != nil {
+		return fmt.Errorf("get session: %w", err)
+	}
+	accountID := sess.PrimaryAccounts[mailCap]
+	if accountID == "" {
+		return fmt.Errorf("no mail account in session")
+	}
+
+	updates := make(map[string]interface{}, len(messageIDs))
+	for _, id := range messageIDs {
+		updates[id] = map[string]interface{}{
+			"mailboxIds": map[string]interface{}{targetMailboxID: true},
+		}
+	}
+
+	resps, err := c.jmapCall(ctx, sess.APIURL, []interface{}{
+		[]interface{}{
+			"Email/set",
+			map[string]interface{}{
+				"accountId": accountID,
+				"update":    updates,
+			},
+			"0",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("email/set: %w", err)
+	}
+	if len(resps) == 0 {
+		return fmt.Errorf("email/set: no response")
+	}
+	var tuple []json.RawMessage
+	if err := json.Unmarshal(resps[0], &tuple); err != nil || len(tuple) < 2 {
+		return fmt.Errorf("malformed Email/set response")
+	}
+	var setArgs struct {
+		NotUpdated map[string]struct {
+			Description string `json:"description"`
+		} `json:"notUpdated"`
+	}
+	if err := json.Unmarshal(tuple[1], &setArgs); err != nil {
+		return fmt.Errorf("decode Email/set args: %w", err)
+	}
+	if len(setArgs.NotUpdated) > 0 {
+		// Collect the first error as representative.
+		for id, e := range setArgs.NotUpdated {
+			return fmt.Errorf("email/set notUpdated for %s: %s", id, e.Description)
+		}
+	}
+	return nil
 }

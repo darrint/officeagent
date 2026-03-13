@@ -1,11 +1,14 @@
 package graph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -299,4 +302,110 @@ func (c *Client) get(ctx context.Context, path string, out interface{}, extraHea
 		return fmt.Errorf("graph %s: %s — %s", resp.Status, body.Error.Code, body.Error.Message)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// post performs an authenticated POST to the Graph API, sending reqBody as JSON
+// and decoding the response into out. Accepts both 200 and 201 as success.
+func (c *Client) post(ctx context.Context, path string, reqBody interface{}, out interface{}) error {
+	tok, err := c.auth.Token(ctx)
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		var body struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return fmt.Errorf("graph POST %s: %s — %s", path, body.Error.Code, body.Error.Message)
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
+}
+
+// mailFolder is a Graph mail folder with its ID and display name.
+type mailFolder struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+}
+
+// GetOrCreateFolder returns the Graph ID of the mail folder with the given
+// display name, creating it at the root if it does not exist.
+func (c *Client) GetOrCreateFolder(ctx context.Context, name string) (string, error) {
+	var resp listResponse[mailFolder]
+	if err := c.get(ctx, "/me/mailFolders?$top=100&$select=id,displayName", &resp); err != nil {
+		return "", fmt.Errorf("list mail folders: %w", err)
+	}
+	for _, f := range resp.Value {
+		if f.DisplayName == name {
+			return f.ID, nil
+		}
+	}
+	// Not found — create it.
+	var created mailFolder
+	if err := c.post(ctx, "/me/mailFolders", map[string]string{"displayName": name}, &created); err != nil {
+		return "", fmt.Errorf("create mail folder: %w", err)
+	}
+	if created.ID == "" {
+		return "", fmt.Errorf("create mail folder: empty id in response")
+	}
+	return created.ID, nil
+}
+
+// MoveMessages moves the given message IDs to the target folder concurrently.
+// Each message requires a separate POST to /me/messages/{id}/move per Graph API.
+func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, len(messageIDs))
+	var wg sync.WaitGroup
+	for _, id := range messageIDs {
+		wg.Add(1)
+		go func(msgID string) {
+			defer wg.Done()
+			path := "/me/messages/" + url.PathEscape(msgID) + "/move"
+			err := c.post(ctx, path, map[string]string{"destinationId": folderID}, nil)
+			results <- result{id: msgID, err: err}
+		}(id)
+	}
+	wg.Wait()
+	close(results)
+
+	var errs []string
+	for r := range results {
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.id, r.err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("move errors: %s", errs[0])
+	}
+	return nil
 }
