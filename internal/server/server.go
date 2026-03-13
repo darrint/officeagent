@@ -321,11 +321,12 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 </style>
 <script>
 function startGenerate(btn) {
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Generating\u2026';
   var bar = document.getElementById('gen-loading-bar');
   if (bar) { bar.style.width = '70%'; }
-  return true; // allow normal form POST to proceed
+  setTimeout(function() {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Generating\u2026';
+  }, 0);
 }
 function archiveLowPrio() {
   var btn = document.getElementById('archive-btn');
