@@ -185,7 +185,7 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 			map[string]interface{}{
 				"accountId": accountID,
 				"#ids": map[string]interface{}{
-					"name":     "0",
+					"name":     "Email/query",
 					"path":     "/ids",
 					"resultOf": "0",
 				},
