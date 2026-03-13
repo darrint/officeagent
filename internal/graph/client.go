@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"golang.org/x/oauth2"
 )
 
 // windowsToIANA maps Windows timezone names to IANA timezone identifiers.
@@ -119,17 +121,24 @@ func resolveLocation(tzName string) *time.Location {
 
 const graphBase = "https://graph.microsoft.com/v1.0"
 
+// tokenProvider is satisfied by *Auth and by test fakes.
+type tokenProvider interface {
+	Token(ctx context.Context) (*oauth2.Token, error)
+}
+
 // Client makes authenticated requests to Microsoft Graph.
 type Client struct {
-	auth *Auth
-	http *http.Client
+	auth    tokenProvider
+	http    *http.Client
+	baseURL string // defaults to graphBase; overridable in tests
 }
 
 // NewClient creates a Graph API client backed by the given Auth.
 func NewClient(auth *Auth) *Client {
 	return &Client{
-		auth: auth,
-		http: &http.Client{Timeout: 30 * time.Second},
+		auth:    auth,
+		http:    &http.Client{Timeout: 30 * time.Second},
+		baseURL: graphBase,
 	}
 }
 
@@ -181,6 +190,9 @@ type graphEvent struct {
 type listResponse[T any] struct {
 	Value []T `json:"value"`
 }
+
+// SetBaseURL overrides the API base URL. Intended for testing only.
+func (c *Client) SetBaseURL(u string) { c.baseURL = u }
 
 // ListMessages returns the top n most recent inbox messages.
 func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
@@ -235,6 +247,22 @@ func (c *Client) ListEvents(ctx context.Context, top int) ([]Event, error) {
 	return events, nil
 }
 
+// User is a simplified representation of a Microsoft Graph user profile.
+type User struct {
+	DisplayName string `json:"displayName"`
+	Mail        string `json:"mail"`
+	UPN         string `json:"userPrincipalName"`
+}
+
+// GetMe returns the authenticated user's profile from /me.
+func (c *Client) GetMe(ctx context.Context) (*User, error) {
+	var u User
+	if err := c.get(ctx, "/me?$select=displayName,mail,userPrincipalName", &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
 // get performs an authenticated GET request to the Graph API and decodes the
 // JSON response into out. Optional extraHeaders maps are merged into the request.
 func (c *Client) get(ctx context.Context, path string, out interface{}, extraHeaders ...map[string]string) error {
@@ -242,7 +270,7 @@ func (c *Client) get(ctx context.Context, path string, out interface{}, extraHea
 	if err != nil {
 		return fmt.Errorf("get token: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, graphBase+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
 		return err
 	}

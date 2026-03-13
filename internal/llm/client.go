@@ -38,6 +38,7 @@ type Client struct {
 	githubToken string
 	model       string
 	http        *http.Client
+	baseURL     string // defaults to copilotAPIBase; overridable in tests
 }
 
 // NewClient creates an LLM client that authenticates with the given GitHub
@@ -47,8 +48,12 @@ func NewClient(githubToken, model string) *Client {
 		githubToken: githubToken,
 		model:       model,
 		http:        &http.Client{Timeout: 60 * time.Second},
+		baseURL:     copilotAPIBase,
 	}
 }
+
+// SetBaseURL overrides the API base URL. Intended for testing only.
+func (c *Client) SetBaseURL(u string) { c.baseURL = u }
 
 // Chat sends a conversation to the LLM and returns the assistant reply text.
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
@@ -61,7 +66,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		copilotAPIBase+"/chat/completions", bytes.NewReader(body))
+		c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
