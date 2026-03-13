@@ -336,7 +336,7 @@ function archiveLowPrio() {
     .then(function(r){ return r.json(); })
     .then(function(d){
       btn.disabled = false;
-      btn.innerHTML = 'Archive Low-Priority Mail';
+      btn.innerHTML = 'Move Low-Priority Mail';
       var parts = [];
       if (d.fastmail_moved > 0) parts.push('Fastmail: ' + d.fastmail_moved + ' archived');
       if (d.graph_moved > 0) parts.push('Office 365: ' + d.graph_moved + ' archived');
@@ -347,7 +347,7 @@ function archiveLowPrio() {
     })
     .catch(function(e){
       btn.disabled = false;
-      btn.innerHTML = 'Archive Low-Priority Mail';
+      btn.innerHTML = 'Move Low-Priority Mail';
       out.textContent = 'Error: ' + e;
     });
 }
@@ -368,7 +368,7 @@ function archiveLowPrio() {
   <div class="gen-bar">
     <span>Generated {{.GeneratedAt}}</span>
     <form method="POST" action="/generate"><button type="submit" onclick="startGenerate(this)">Regenerate</button></form>
-    <button type="button" id="archive-btn" onclick="archiveLowPrio()">Archive Low-Priority Mail</button>
+    <button type="button" id="archive-btn" onclick="archiveLowPrio()">Move Low-Priority Mail</button>
   </div>
   <div id="archive-result" style="font-size:.82rem;color:#555;margin-bottom:.75rem;padding:0 1rem"></div>
   <div class="section">
@@ -642,12 +642,12 @@ button:hover{background:#006cbd}
     <div class="card">
       <label for="fastmail_lowprio_folder">Fastmail low-priority folder name</label>
       <input type="text" id="fastmail_lowprio_folder" name="fastmail_lowprio_folder" value="{{.FastmailLowPrioFolder}}" placeholder="Low Priority">
-      <p class="hint">Fastmail mailbox to move low-priority mail into when "Archive Low-Priority Mail" is used.</p>
+      <p class="hint">Fastmail mailbox to move low-priority mail into when "Move Low-Priority Mail" is used.</p>
     </div>
     <div class="card">
       <label for="graph_lowprio_folder">Office 365 low-priority folder name</label>
       <input type="text" id="graph_lowprio_folder" name="graph_lowprio_folder" value="{{.GraphLowPrioFolder}}" placeholder="Low Priority">
-      <p class="hint">Office 365 mail folder to move low-priority mail into when "Archive Low-Priority Mail" is used.</p>
+      <p class="hint">Office 365 mail folder to move low-priority mail into when "Move Low-Priority Mail" is used.</p>
     </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
