@@ -29,6 +29,10 @@ func New(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// SQLite does not support concurrent writers. Limiting the pool to a single
+	// connection also ensures that :memory: databases (used in tests) are not
+	// split across multiple connections, each of which would see an empty DB.
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
@@ -49,20 +53,26 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		return fmt.Errorf("set busy timeout: %w", err)
 	}
-	_, err := s.db.Exec(`
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
-		);
+		)
+	`); err != nil {
+		return fmt.Errorf("create kv table: %w", err)
+	}
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS feedback (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			section    TEXT NOT NULL,
 			rating     TEXT NOT NULL,
 			note       TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-	`)
-	return err
+		)
+	`); err != nil {
+		return fmt.Errorf("create feedback table: %w", err)
+	}
+	return nil
 }
 
 // Get returns the value for key, or "" if not found.

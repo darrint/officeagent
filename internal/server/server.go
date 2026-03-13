@@ -123,6 +123,7 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleSummaryPage)
+	s.mux.HandleFunc("POST /generate", s.handleGenerate)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
 	s.mux.HandleFunc("GET /login", s.handleLogin)
@@ -183,6 +184,14 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 .feedback button:hover{border-color:#0078d4;background:#f0f6ff}
 .feedback input[type=text]{flex:1;min-width:160px;padding:.3rem .6rem;font-size:.82rem;border:1px solid #ddd;border-radius:6px;color:#1a1a1a}
 .feedback input[type=text]:focus{outline:none;border-color:#0078d4}
+.gen-bar{display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem;padding:.6rem 1rem;background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.gen-bar span{flex:1;font-size:.82rem;color:#888}
+.gen-bar button{background:#0078d4;color:#fff;border:none;border-radius:6px;padding:.4rem 1rem;font-size:.85rem;font-weight:600;cursor:pointer}
+.gen-bar button:hover{background:#006cbd}
+.empty-state{text-align:center;padding:4rem 2rem}
+.empty-state p{color:#888;margin-bottom:1.5rem}
+.empty-state button{background:#0078d4;color:#fff;border:none;border-radius:8px;padding:.75rem 2rem;font-size:1rem;font-weight:600;cursor:pointer}
+.empty-state button:hover{background:#006cbd}
 </style>
 </head>
 <body>
@@ -194,7 +203,11 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
   </header>
   {{if .FatalError}}
   <div class="error">{{.FatalError}}</div>
-  {{else}}
+  {{else if .GeneratedAt}}
+  <div class="gen-bar">
+    <span>Generated {{.GeneratedAt}}</span>
+    <form method="POST" action="/generate"><button type="submit">Regenerate</button></form>
+  </div>
   <div class="section">
     <div class="section-title">Email</div>
     {{if .Email.Error}}<div class="error">{{.Email.Error}}</div>
@@ -240,6 +253,11 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
     <summary>Raw JSON</summary>
     <pre>{{.RawJSON}}</pre>
   </details>
+  {{else}}
+  <div class="empty-state">
+    <p>No briefing generated yet.</p>
+    <form method="POST" action="/generate"><button type="submit">Generate Briefing</button></form>
+  </div>
   {{end}}
 </div>
 </body>
@@ -252,11 +270,12 @@ type sectionData struct {
 }
 
 type pageData struct {
-	Email      sectionData
-	Calendar   sectionData
-	GitHub     sectionData
-	RawJSON    string
-	FatalError string
+	Email       sectionData
+	Calendar    sectionData
+	GitHub      sectionData
+	RawJSON     string
+	GeneratedAt string // empty = no cached report yet
+	FatalError  string
 }
 
 // mdRenderer is a goldmark instance with GFM extensions (tables, strikethrough,
@@ -574,16 +593,103 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch email and calendar data concurrently.
-	type emailResult struct {
-		section sectionData
+	// Render from cache — no API or LLM calls on a plain page load.
+	cached, err := s.loadLastReport()
+	if err != nil {
+		log.Printf("load last report: %v", err)
 	}
-	type calResult struct {
-		section sectionData
+	if cached == nil {
+		// No report yet — show empty state with Generate button.
+		servePage(pageData{})
+		return
 	}
-	type ghResult struct {
-		section sectionData
+
+	rawJSON, _ := json.MarshalIndent(map[string]string{
+		"email":    cached.EmailRaw,
+		"calendar": cached.CalendarRaw,
+		"github":   cached.GitHubRaw,
+	}, "", "  ")
+
+	servePage(pageData{
+		Email:       sectionDataFromCache(cached.EmailRaw, cached.EmailError),
+		Calendar:    sectionDataFromCache(cached.CalendarRaw, cached.CalendarError),
+		GitHub:      sectionDataFromCache(cached.GitHubRaw, cached.GitHubError),
+		RawJSON:     string(rawJSON),
+		GeneratedAt: cached.GeneratedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+	})
+}
+
+// sectionDataFromCache reconstructs a sectionData from stored raw text / error.
+func sectionDataFromCache(raw, errStr string) sectionData {
+	if errStr != "" {
+		return sectionData{Error: errStr}
 	}
+	if raw == "" {
+		return sectionData{}
+	}
+	return sectionData{HTML: renderMarkdown(raw), Raw: raw}
+}
+
+// cachedReport is the serialised form of a generated morning briefing stored
+// in SQLite so that GET / can render without hitting any external APIs.
+type cachedReport struct {
+	EmailRaw      string    `json:"email_raw"`
+	CalendarRaw   string    `json:"calendar_raw"`
+	GitHubRaw     string    `json:"github_raw"`
+	EmailError    string    `json:"email_error,omitempty"`
+	CalendarError string    `json:"calendar_error,omitempty"`
+	GitHubError   string    `json:"github_error,omitempty"`
+	GeneratedAt   time.Time `json:"generated_at"`
+}
+
+const reportStoreKey = "report.last"
+
+// loadLastReport retrieves the last cached report from the store.
+// Returns (nil, nil) when no report has been generated yet.
+func (s *Server) loadLastReport() (*cachedReport, error) {
+	if s.store == nil {
+		return nil, nil
+	}
+	raw, err := s.store.Get(reportStoreKey)
+	if err != nil {
+		return nil, fmt.Errorf("store get %s: %w", reportStoreKey, err)
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var r cachedReport
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		return nil, fmt.Errorf("unmarshal report: %w", err)
+	}
+	return &r, nil
+}
+
+// saveLastReport persists the cached report to the store.
+func (s *Server) saveLastReport(rep *cachedReport) error {
+	if s.store == nil {
+		return nil
+	}
+	b, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("marshal report: %w", err)
+	}
+	return s.store.Set(reportStoreKey, string(b))
+}
+
+func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if s.llm == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	// Fetch email, calendar, and GitHub data concurrently.
+	type emailResult struct{ section sectionData }
+	type calResult struct{ section sectionData }
+	type ghResult struct{ section sectionData }
 
 	emailCh := make(chan emailResult, 1)
 	calCh := make(chan calResult, 1)
@@ -610,7 +716,7 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		}
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
-				Role:    "system",
+				Role: "system",
 				Content: buildSystemPrompt(
 					s.getPrompt("overall", defaultOverallPrompt),
 					s.getPrompt("email", defaultEmailPrompt)+s.feedbackContext("email"),
@@ -645,7 +751,7 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		}
 		reply, err := s.llm.Chat(r.Context(), []llm.Message{
 			{
-				Role:    "system",
+				Role: "system",
 				Content: buildSystemPrompt(
 					s.getPrompt("overall", defaultOverallPrompt),
 					s.getPrompt("calendar", defaultCalendarPrompt)+s.feedbackContext("calendar"),
@@ -707,18 +813,20 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 	calRes := <-calCh
 	ghRes := <-ghCh
 
-	rawJSON, _ := json.MarshalIndent(map[string]string{
-		"email":    emailRes.section.Raw,
-		"calendar": calRes.section.Raw,
-		"github":   ghRes.section.Raw,
-	}, "", "  ")
+	rep := &cachedReport{
+		EmailRaw:      emailRes.section.Raw,
+		CalendarRaw:   calRes.section.Raw,
+		GitHubRaw:     ghRes.section.Raw,
+		EmailError:    emailRes.section.Error,
+		CalendarError: calRes.section.Error,
+		GitHubError:   ghRes.section.Error,
+		GeneratedAt:   time.Now().UTC(),
+	}
+	if err := s.saveLastReport(rep); err != nil {
+		log.Printf("save last report: %v", err)
+	}
 
-	servePage(pageData{
-		Email:    emailRes.section,
-		Calendar: calRes.section,
-		GitHub:   ghRes.section,
-		RawJSON:  string(rawJSON),
-	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

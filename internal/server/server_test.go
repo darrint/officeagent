@@ -506,7 +506,7 @@ func TestLastWorkDaySince_wednesday(t *testing.T) {
 	}
 }
 
-// --- handleSummaryPage GitHub section ---
+// --- handleSummaryPage / handleGenerate ---
 
 func newSummaryServer(t *testing.T, auth authService, gc graphService, lc llmService, ghc githubService, st *store.Store) *Server {
 	t.Helper()
@@ -524,6 +524,95 @@ func newSummaryServer(t *testing.T, auth authService, gc graphService, lc llmSer
 	return s
 }
 
+func TestHandleSummaryPage_emptyState(t *testing.T) {
+	// GET / with no cached report → empty state + Generate button, no API calls.
+	st := newMemStore(t)
+	lc := fakeLLM{reply: "should not be called"}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, fakeGraph{}, lc, nil, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Generate Briefing") {
+		t.Errorf("expected Generate Briefing button in empty state, got:\n%s", body)
+	}
+	if strings.Contains(body, "Email") || strings.Contains(body, "Calendar") {
+		t.Errorf("expected no section content in empty state")
+	}
+}
+
+func TestHandleGenerate_storesAndRedirects(t *testing.T) {
+	// POST /generate → fetches, stores, redirects to /; GET / renders from cache.
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	lc := fakeLLM{reply: "LLM summary"}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+
+	// Trigger generation.
+	req := httptest.NewRequest(http.MethodPost, "/generate", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect after generate, got %d", w.Code)
+	}
+	if w.Header().Get("Location") != "/" {
+		t.Errorf("expected redirect to /, got %s", w.Header().Get("Location"))
+	}
+
+	// GET / should now show the cached report.
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	w2 := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on GET /, got %d", w2.Code)
+	}
+	body := w2.Body.String()
+	if !strings.Contains(body, "Generated") {
+		t.Errorf("expected Generated timestamp in page, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Regenerate") {
+		t.Errorf("expected Regenerate button in page, got:\n%s", body)
+	}
+	if !strings.Contains(body, "LLM summary") {
+		t.Errorf("expected LLM reply in page, got:\n%s", body)
+	}
+}
+
+func TestHandleGenerate_pageRefreshDoesNotRegenerate(t *testing.T) {
+	// After a generate, repeated GET / calls must NOT call the LLM again.
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	calls := 0
+	lc := &callCountLLM{reply: "LLM summary", counter: &calls}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+
+	// One generate.
+	req := httptest.NewRequest(http.MethodPost, "/generate", nil)
+	srv.mux.ServeHTTP(httptest.NewRecorder(), req)
+
+	// Three page loads — should not increase call count.
+	for i := 0; i < 3; i++ {
+		srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}
+	// The LLM was called once (email) + once (calendar) = 2 during generate; no more.
+	if calls > 2 {
+		t.Errorf("expected at most 2 LLM calls (one per section during generate), got %d", calls)
+	}
+}
+
 func TestHandleSummaryPage_githubSection(t *testing.T) {
 	st := newMemStore(t)
 	gc := fakeGraph{
@@ -537,6 +626,10 @@ func TestHandleSummaryPage_githubSection(t *testing.T) {
 	lc := fakeLLM{reply: "Here is your GitHub PR summary."}
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
 
+	// Generate first.
+	srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/generate", nil))
+
+	// Now GET / should show the GitHub section.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 	srv.mux.ServeHTTP(w, req)
@@ -560,8 +653,9 @@ func TestHandleSummaryPage_githubNotConfigured(t *testing.T) {
 		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
 	}
 	lc := fakeLLM{reply: "summary"}
-	// ghClient is nil — GitHub section should not appear
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+
+	srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/generate", nil))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
@@ -570,8 +664,7 @@ func TestHandleSummaryPage_githubNotConfigured(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	body := w.Body.String()
-	if strings.Contains(body, "GitHub PRs") {
+	if strings.Contains(w.Body.String(), "GitHub PRs") {
 		t.Errorf("expected GitHub PRs section to be absent when ghClient is nil")
 	}
 }
@@ -586,6 +679,8 @@ func TestHandleSummaryPage_githubError(t *testing.T) {
 	lc := fakeLLM{reply: "summary"}
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
 
+	srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/generate", nil))
+
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 	srv.mux.ServeHTTP(w, req)
@@ -593,8 +688,18 @@ func TestHandleSummaryPage_githubError(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "rate limit exceeded") {
-		t.Errorf("expected error detail in body, got:\n%s", body)
+	if !strings.Contains(w.Body.String(), "rate limit exceeded") {
+		t.Errorf("expected error detail in body, got:\n%s", w.Body.String())
 	}
+}
+
+// callCountLLM is a fake LLM that counts how many times Chat is called.
+type callCountLLM struct {
+	reply   string
+	counter *int
+}
+
+func (f *callCountLLM) Chat(_ context.Context, _ []llm.Message) (string, error) {
+	*f.counter++
+	return f.reply, nil
 }
