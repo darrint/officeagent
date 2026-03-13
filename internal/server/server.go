@@ -1373,16 +1373,19 @@ func briefingMarkdown(rep *cachedReport) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-// sendNtfyReport generates a fresh briefing and sends it to ntfy if a topic is
-// configured. Returns an error if the topic is not set or any step fails.
+// sendNtfyReport loads the last cached report and sends it to ntfy.
+// Returns an error if the topic is not set, no report exists, or the send fails.
 func (s *Server) sendNtfyReport(ctx context.Context) error {
 	topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
 	if topic == "" {
 		return fmt.Errorf("ntfy topic not configured")
 	}
-	rep, err := s.GenerateBriefing(ctx)
+	rep, err := s.loadLastReport()
 	if err != nil {
-		return fmt.Errorf("generate briefing: %w", err)
+		return fmt.Errorf("load report: %w", err)
+	}
+	if rep == nil {
+		return fmt.Errorf("no report generated yet")
 	}
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
@@ -1409,7 +1412,11 @@ func (s *Server) StartScheduler(ctx context.Context) {
 				log.Println("scheduler: ntfy topic not configured, skipping send")
 				continue
 			}
-			log.Println("scheduler: sending 7 AM briefing via ntfy")
+			log.Println("scheduler: generating and sending 7 AM briefing via ntfy")
+			if _, err := s.GenerateBriefing(ctx); err != nil {
+				log.Printf("scheduler: generate briefing failed: %v", err)
+				continue
+			}
 			if err := s.sendNtfyReport(ctx); err != nil {
 				log.Printf("scheduler: ntfy send failed: %v", err)
 			} else {
