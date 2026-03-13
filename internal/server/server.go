@@ -53,6 +53,36 @@ type fastmailService interface {
 	ListMessages(ctx context.Context, top int) ([]fastmail.Message, error)
 }
 
+// fastmailMoverService extends fastmailService with archive capabilities.
+type fastmailMoverService interface {
+	fastmailService
+	GetOrCreateMailbox(ctx context.Context, name string) (string, error)
+	MoveMessages(ctx context.Context, messageIDs []string, targetMailboxID string) error
+}
+
+// graphMoverService extends graphService with archive capabilities.
+type graphMoverService interface {
+	graphService
+	GetOrCreateFolder(ctx context.Context, name string) (string, error)
+	MoveMessages(ctx context.Context, messageIDs []string, folderID string) error
+}
+
+// classifyMsg is a compact message descriptor sent to the LLM for classification.
+type classifyMsg struct {
+	ID      string
+	From    string
+	Subject string
+	Preview string
+}
+
+// archiveResult is returned as JSON from POST /archive-lowprio.
+type archiveResult struct {
+	FastmailMoved int    `json:"fastmail_moved"`
+	GraphMoved    int    `json:"graph_moved"`
+	FastmailError string `json:"fastmail_error,omitempty"`
+	GraphError    string `json:"graph_error,omitempty"`
+}
+
 // Default system prompts. Used when no custom prompt is stored.
 const (
 	defaultOverallPrompt   = ""
@@ -222,6 +252,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /settings", s.handleSettingsGet)
 	s.mux.HandleFunc("POST /settings", s.handleSettingsPost)
 	s.mux.HandleFunc("POST /feedback", s.handleFeedback)
+	s.mux.HandleFunc("POST /archive-lowprio", s.handleArchiveLowPrio)
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
 	s.mux.HandleFunc("GET /api/llm/ping", s.handleLLMPing)
@@ -278,13 +309,52 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 .gen-bar span{flex:1;font-size:.82rem;color:#888}
 .gen-bar button{background:#0078d4;color:#fff;border:none;border-radius:6px;padding:.4rem 1rem;font-size:.85rem;font-weight:600;cursor:pointer}
 .gen-bar button:hover{background:#006cbd}
+.gen-bar button:disabled{background:#99c0e8;cursor:not-allowed}
 .empty-state{text-align:center;padding:4rem 2rem}
 .empty-state p{color:#888;margin-bottom:1.5rem}
 .empty-state button{background:#0078d4;color:#fff;border:none;border-radius:8px;padding:.75rem 2rem;font-size:1rem;font-weight:600;cursor:pointer}
 .empty-state button:hover{background:#006cbd}
+.empty-state button:disabled{background:#99c0e8;cursor:not-allowed}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:.85em;height:.85em;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:.35em}
+#gen-loading-bar{position:fixed;top:0;left:0;height:3px;background:#0078d4;width:0;transition:width .3s ease;z-index:9999}
 </style>
+<script>
+function startGenerate(btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Generating\u2026';
+  var bar = document.getElementById('gen-loading-bar');
+  if (bar) { bar.style.width = '70%'; }
+  return true; // allow normal form POST to proceed
+}
+function archiveLowPrio() {
+  var btn = document.getElementById('archive-btn');
+  var out = document.getElementById('archive-result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner" style="border-color:rgba(0,0,0,.2);border-top-color:#0078d4"></span>Archiving\u2026';
+  fetch('/archive-lowprio', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      btn.disabled = false;
+      btn.innerHTML = 'Archive Low-Priority Mail';
+      var parts = [];
+      if (d.fastmail_moved > 0) parts.push('Fastmail: ' + d.fastmail_moved + ' archived');
+      if (d.graph_moved > 0) parts.push('Office 365: ' + d.graph_moved + ' archived');
+      if (d.fastmail_error) parts.push('Fastmail error: ' + d.fastmail_error);
+      if (d.graph_error) parts.push('Office 365 error: ' + d.graph_error);
+      if (parts.length === 0) parts.push('No low-priority mail found.');
+      out.textContent = parts.join(' \u00b7 ');
+    })
+    .catch(function(e){
+      btn.disabled = false;
+      btn.innerHTML = 'Archive Low-Priority Mail';
+      out.textContent = 'Error: ' + e;
+    });
+}
+</script>
 </head>
 <body>
+<div id="gen-loading-bar"></div>
 <div class="wrap">
   <header>
     <h1>officeagent</h1>
@@ -297,8 +367,10 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
   {{else if .GeneratedAt}}
   <div class="gen-bar">
     <span>Generated {{.GeneratedAt}}</span>
-    <form method="POST" action="/generate"><button type="submit">Regenerate</button></form>
+    <form method="POST" action="/generate"><button type="submit" onclick="startGenerate(this)">Regenerate</button></form>
+    <button type="button" id="archive-btn" onclick="archiveLowPrio()">Archive Low-Priority Mail</button>
   </div>
+  <div id="archive-result" style="font-size:.82rem;color:#555;margin-bottom:.75rem;padding:0 1rem"></div>
   <div class="section">
     <div class="section-title">Email</div>
     {{if .Email.Error}}<div class="error">{{.Email.Error}}</div>
@@ -362,7 +434,7 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
   {{else}}
   <div class="empty-state">
     <p>No briefing generated yet.</p>
-    <form method="POST" action="/generate"><button type="submit">Generate Briefing</button></form>
+    <form method="POST" action="/generate"><button type="submit" onclick="startGenerate(this)">Generate Briefing</button></form>
   </div>
   {{end}}
 </div>
@@ -567,6 +639,16 @@ button:hover{background:#006cbd}
       <input type="text" id="azure_client_id" name="azure_client_id" value="{{.AzureClientID}}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
       <p class="hint">Azure AD app client ID used for Microsoft Graph OAuth. Register the app in Azure Portal under "Mobile and desktop applications" with redirect URI <code>http://localhost:8080/login/callback</code>.</p>
     </div>
+    <div class="card">
+      <label for="fastmail_lowprio_folder">Fastmail low-priority folder name</label>
+      <input type="text" id="fastmail_lowprio_folder" name="fastmail_lowprio_folder" value="{{.FastmailLowPrioFolder}}" placeholder="Low Priority">
+      <p class="hint">Fastmail mailbox to move low-priority mail into when "Archive Low-Priority Mail" is used.</p>
+    </div>
+    <div class="card">
+      <label for="graph_lowprio_folder">Office 365 low-priority folder name</label>
+      <input type="text" id="graph_lowprio_folder" name="graph_lowprio_folder" value="{{.GraphLowPrioFolder}}" placeholder="Low Priority">
+      <p class="hint">Office 365 mail folder to move low-priority mail into when "Archive Low-Priority Mail" is used.</p>
+    </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
       {{if .Saved}}<span class="saved">&#10003; Saved</span>{{end}}
@@ -577,17 +659,19 @@ button:hover{background:#006cbd}
 </html>`))
 
 type settingsData struct {
-	OverallPrompt      string
-	EmailPrompt        string
-	CalendarPrompt     string
-	GitHubPrompt       string
-	FastmailPrompt     string
-	GitHubLookbackDays string
-	GitHubOrgs         string
-	GitHubTokenSet     bool   // true if a GitHub token is stored (never echo the value)
-	FastmailTokenSet   bool   // true if a Fastmail token is stored (never echo the value)
-	AzureClientID      string // not a secret — can be shown in the UI
-	Saved              bool
+	OverallPrompt          string
+	EmailPrompt            string
+	CalendarPrompt         string
+	GitHubPrompt           string
+	FastmailPrompt         string
+	GitHubLookbackDays     string
+	GitHubOrgs             string
+	GitHubTokenSet         bool   // true if a GitHub token is stored (never echo the value)
+	FastmailTokenSet       bool   // true if a Fastmail token is stored (never echo the value)
+	AzureClientID          string // not a secret — can be shown in the UI
+	FastmailLowPrioFolder  string
+	GraphLowPrioFolder     string
+	Saved                  bool
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -596,17 +680,19 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := settingsData{
-		OverallPrompt:      s.getPrompt("overall", defaultOverallPrompt),
-		EmailPrompt:        s.getPrompt("email", defaultEmailPrompt),
-		CalendarPrompt:     s.getPrompt("calendar", defaultCalendarPrompt),
-		GitHubPrompt:       s.getPrompt("github", defaultGitHubPrompt),
-		FastmailPrompt:     s.getPrompt("fastmail", defaultFastmailPrompt),
-		GitHubLookbackDays: s.getSetting("github.lookback_days", "0"),
-		GitHubOrgs:         s.getSetting("github.orgs", ""),
-		GitHubTokenSet:     s.effectiveGitHubToken() != "",
-		FastmailTokenSet:   s.effectiveFastmailToken() != "",
-		AzureClientID:      s.effectiveAzureClientID(),
-		Saved:              r.URL.Query().Get("saved") == "1",
+		OverallPrompt:         s.getPrompt("overall", defaultOverallPrompt),
+		EmailPrompt:           s.getPrompt("email", defaultEmailPrompt),
+		CalendarPrompt:        s.getPrompt("calendar", defaultCalendarPrompt),
+		GitHubPrompt:          s.getPrompt("github", defaultGitHubPrompt),
+		FastmailPrompt:        s.getPrompt("fastmail", defaultFastmailPrompt),
+		GitHubLookbackDays:    s.getSetting("github.lookback_days", "0"),
+		GitHubOrgs:            s.getSetting("github.orgs", ""),
+		GitHubTokenSet:        s.effectiveGitHubToken() != "",
+		FastmailTokenSet:      s.effectiveFastmailToken() != "",
+		AzureClientID:         s.effectiveAzureClientID(),
+		FastmailLowPrioFolder: s.getSetting("fastmail_lowprio_folder", "Low Priority"),
+		GraphLowPrioFolder:    s.getSetting("graph_lowprio_folder", "Low Priority"),
+		Saved:                 r.URL.Query().Get("saved") == "1",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := settingsTmpl.Execute(w, data); err != nil {
@@ -633,6 +719,8 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	githubToken := strings.TrimSpace(r.FormValue("github_token"))
 	fastmailToken := strings.TrimSpace(r.FormValue("fastmail_token"))
 	azureClientID := strings.TrimSpace(r.FormValue("azure_client_id"))
+	fastmailLowPrioFolder := strings.TrimSpace(r.FormValue("fastmail_lowprio_folder"))
+	graphLowPrioFolder := strings.TrimSpace(r.FormValue("graph_lowprio_folder"))
 
 	if s.store != nil {
 		if err := s.store.Set("prompt.overall", overallPrompt); err != nil {
@@ -675,6 +763,16 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		if azureClientID != "" {
 			if err := s.store.Set("setting.azure_client_id", azureClientID); err != nil {
 				log.Printf("store set setting.azure_client_id: %v", err)
+			}
+		}
+		if fastmailLowPrioFolder != "" {
+			if err := s.store.Set("setting.fastmail_lowprio_folder", fastmailLowPrioFolder); err != nil {
+				log.Printf("store set setting.fastmail_lowprio_folder: %v", err)
+			}
+		}
+		if graphLowPrioFolder != "" {
+			if err := s.store.Set("setting.graph_lowprio_folder", graphLowPrioFolder); err != nil {
+				log.Printf("store set setting.graph_lowprio_folder: %v", err)
 			}
 		}
 	}
@@ -735,6 +833,183 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// parseLLMIDs extracts a JSON array of string IDs from an LLM reply.
+// It strips markdown code fences before parsing.
+func parseLLMIDs(reply string) []string {
+	s := strings.TrimSpace(reply)
+	// Strip markdown code fences.
+	if idx := strings.Index(s, "```"); idx >= 0 {
+		s = s[idx+3:]
+		if nl := strings.Index(s, "\n"); nl >= 0 {
+			s = s[nl+1:]
+		}
+		if end := strings.LastIndex(s, "```"); end >= 0 {
+			s = s[:end]
+		}
+	}
+	s = strings.TrimSpace(s)
+	// Find JSON array bounds.
+	start := strings.Index(s, "[")
+	end := strings.LastIndex(s, "]")
+	if start < 0 || end <= start {
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(s[start:end+1]), &ids); err != nil {
+		log.Printf("parseLLMIDs: unmarshal error: %v (input: %q)", err, s[start:end+1])
+		return nil
+	}
+	return ids
+}
+
+// filterToKnownIDs returns only the IDs from proposed that appear in known.
+// This prevents the LLM from returning hallucinated IDs.
+func filterToKnownIDs(proposed []string, known []classifyMsg) []string {
+	set := make(map[string]struct{}, len(known))
+	for _, m := range known {
+		set[m.ID] = struct{}{}
+	}
+	var out []string
+	for _, id := range proposed {
+		if _, ok := set[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// classifyLowPriority asks the LLM to identify low-priority messages from msgs.
+// Returns the IDs the LLM identified as low priority (unvalidated — caller must
+// call filterToKnownIDs before using them).
+func classifyLowPriority(ctx context.Context, msgs []classifyMsg, llmC llmService) ([]string, error) {
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	var sb strings.Builder
+	for _, m := range msgs {
+		fmt.Fprintf(&sb, "ID: %s\nFrom: %s\nSubject: %s\nPreview: %s\n\n", m.ID, m.From, m.Subject, m.Preview)
+	}
+	systemPrompt := "You are an email assistant. Identify which of the following emails are low priority: newsletters, marketing, automated notifications, promotional offers, social media digests, and other non-actionable bulk messages. Return ONLY a JSON array of IDs for the low-priority messages. No explanation, no markdown, just the JSON array. If none are low priority return []."
+	reply, err := llmC.Chat(ctx, []llm.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: sb.String()},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("LLM classify: %w", err)
+	}
+	return parseLLMIDs(reply), nil
+}
+
+// archiveFastmailLowPrio classifies and moves low-priority Fastmail messages.
+// Returns count moved and error string (empty on success).
+func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (int, string) {
+	fmC, ok := s.getFMClient().(fastmailMoverService)
+	if !ok {
+		return 0, "" // Fastmail not configured or client doesn't support moving
+	}
+	folderName := s.getSetting("fastmail_lowprio_folder", "Low Priority")
+
+	rawMsgs, err := fmC.ListMessages(ctx, 30)
+	if err != nil {
+		return 0, fmt.Sprintf("list messages: %v", err)
+	}
+	msgs := make([]classifyMsg, len(rawMsgs))
+	for i, m := range rawMsgs {
+		msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+	}
+
+	proposed, err := classifyLowPriority(ctx, msgs, llmC)
+	if err != nil {
+		return 0, err.Error()
+	}
+	ids := filterToKnownIDs(proposed, msgs)
+	if len(ids) == 0 {
+		return 0, ""
+	}
+
+	mailboxID, err := fmC.GetOrCreateMailbox(ctx, folderName)
+	if err != nil {
+		return 0, fmt.Sprintf("get/create mailbox: %v", err)
+	}
+	if err := fmC.MoveMessages(ctx, ids, mailboxID); err != nil {
+		return 0, fmt.Sprintf("move messages: %v", err)
+	}
+	return len(ids), ""
+}
+
+// archiveGraphLowPrio classifies and moves low-priority Graph (Office 365) messages.
+// Returns count moved and error string (empty on success).
+func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (int, string) {
+	gC, ok := s.client.(graphMoverService)
+	if !ok {
+		return 0, "" // Graph not configured or client doesn't support moving
+	}
+	folderName := s.getSetting("graph_lowprio_folder", "Low Priority")
+
+	rawMsgs, err := gC.ListMessages(ctx, 30)
+	if err != nil {
+		return 0, fmt.Sprintf("list messages: %v", err)
+	}
+	msgs := make([]classifyMsg, len(rawMsgs))
+	for i, m := range rawMsgs {
+		msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+	}
+
+	proposed, err := classifyLowPriority(ctx, msgs, llmC)
+	if err != nil {
+		return 0, err.Error()
+	}
+	ids := filterToKnownIDs(proposed, msgs)
+	if len(ids) == 0 {
+		return 0, ""
+	}
+
+	folderID, err := gC.GetOrCreateFolder(ctx, folderName)
+	if err != nil {
+		return 0, fmt.Sprintf("get/create folder: %v", err)
+	}
+	if err := gC.MoveMessages(ctx, ids, folderID); err != nil {
+		return 0, fmt.Sprintf("move messages: %v", err)
+	}
+	return len(ids), ""
+}
+
+// handleArchiveLowPrio handles POST /archive-lowprio — classifies inbox messages
+// from both Fastmail and Graph and moves low-priority ones to a holding folder.
+func (s *Server) handleArchiveLowPrio(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	llmC := s.getLLM()
+	if llmC == nil {
+		http.Error(w, "LLM not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx := r.Context()
+	var result archiveResult
+
+	// Run Fastmail and Graph archives concurrently.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		n, errStr := s.archiveFastmailLowPrio(ctx, llmC)
+		result.FastmailMoved = n
+		result.FastmailError = errStr
+	}()
+	go func() {
+		defer wg.Done()
+		n, errStr := s.archiveGraphLowPrio(ctx, llmC)
+		result.GraphMoved = n
+		result.GraphError = errStr
+	}()
+	wg.Wait()
+
+	writeJSON(w, result)
 }
 
 func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
