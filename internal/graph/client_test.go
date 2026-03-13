@@ -120,7 +120,7 @@ func TestParseEventTime_invalidDate(t *testing.T) {
 
 func TestListMessages_success(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/me/messages") {
+		if !strings.HasPrefix(r.URL.Path, "/me/mailFolders/inbox/messages") {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer fake-access-token" {

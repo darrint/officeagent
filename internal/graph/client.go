@@ -200,7 +200,7 @@ func (c *Client) SetBaseURL(u string) { c.baseURL = u }
 // ListMessages returns the top n most recent inbox messages.
 func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 	var resp listResponse[graphMessage]
-	path := fmt.Sprintf("/me/messages?$top=%d&$orderby=receivedDateTime+desc&$select=id,subject,receivedDateTime,bodyPreview,from", top)
+	path := fmt.Sprintf("/me/mailFolders/inbox/messages?$top=%d&$orderby=receivedDateTime+desc&$select=id,subject,receivedDateTime,bodyPreview,from", top)
 	if err := c.get(ctx, path, &resp); err != nil {
 		return nil, err
 	}
