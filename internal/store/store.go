@@ -38,6 +38,17 @@ func New(path string) (*Store, error) {
 }
 
 func (s *Store) migrate() error {
+	// WAL mode allows concurrent readers alongside a single writer, dramatically
+	// reducing SQLITE_BUSY errors when multiple goroutines access the store.
+	if _, err := s.db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return fmt.Errorf("set WAL mode: %w", err)
+	}
+	// Wait up to 5 seconds before returning SQLITE_BUSY instead of failing
+	// immediately. This covers short write contention (e.g. the doctor check
+	// writing a ping key while a handler reads prompts).
+	if _, err := s.db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		return fmt.Errorf("set busy timeout: %w", err)
+	}
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,

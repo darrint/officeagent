@@ -1,10 +1,11 @@
 package server
 
 // White-box tests for server-package pure functions and HTTP handlers.
-// Uses a fake authService to avoid requiring a real OAuth flow.
+// Uses fake interface implementations to avoid requiring real OAuth, Graph, or LLM calls.
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,11 +14,14 @@ import (
 
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/graph"
+	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
 	"golang.org/x/oauth2"
 )
 
-// fakeAuth implements authService. Authenticated field controls IsAuthenticated.
+// --- fakes ---
+
+// fakeAuth implements authService. Authenticated controls IsAuthenticated.
 type fakeAuth struct {
 	authenticated bool
 }
@@ -30,6 +34,33 @@ func (f fakeAuth) ExchangeCode(_ context.Context, _, _, _ string) (*oauth2.Token
 	return &oauth2.Token{AccessToken: "tok"}, nil
 }
 
+// fakeGraph implements graphService.
+type fakeGraph struct {
+	msgs    []graph.Message
+	events  []graph.Event
+	msgsErr error
+	evtsErr error
+}
+
+func (f fakeGraph) ListMessages(_ context.Context, _ int) ([]graph.Message, error) {
+	return f.msgs, f.msgsErr
+}
+func (f fakeGraph) ListEvents(_ context.Context, _ int) ([]graph.Event, error) {
+	return f.events, f.evtsErr
+}
+
+// fakeLLM implements llmService.
+type fakeLLM struct {
+	reply string
+	err   error
+}
+
+func (f fakeLLM) Chat(_ context.Context, _ []llm.Message) (string, error) {
+	return f.reply, f.err
+}
+
+// --- helpers ---
+
 // newTestServer builds a minimal Server for handler tests.
 func newTestServer(t *testing.T, auth authService, st *store.Store) *Server {
 	t.Helper()
@@ -38,7 +69,7 @@ func newTestServer(t *testing.T, auth authService, st *store.Store) *Server {
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
 		auth:          auth,
-		client:        &graph.Client{},
+		client:        fakeGraph{},
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
 	}
@@ -273,5 +304,130 @@ func TestHandleLoginStatus_unauthenticated(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "false") {
 		t.Errorf("expected 'false' in body, got: %s", w.Body.String())
+	}
+}
+
+// --- handleDoctor ---
+
+func newDoctorServer(t *testing.T, auth authService, gc graphService, lc llmService, st *store.Store) *Server {
+	t.Helper()
+	s := &Server{
+		cfg:           config.Default(),
+		mux:           http.NewServeMux(),
+		auth:          auth,
+		client:        gc,
+		llm:           lc,
+		store:         st,
+		pendingLogins: make(map[string]pendingLogin),
+	}
+	s.routes()
+	return s
+}
+
+func TestHandleDoctor_allOK(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	lc := fakeLLM{reply: "pong"}
+	srv := newDoctorServer(t, fakeAuth{authenticated: true}, gc, lc, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	// All four checks should show OK
+	if strings.Count(body, `class="ok"`) < 4 {
+		t.Errorf("expected 4 ok checks in body, got:\n%s", body)
+	}
+	if strings.Contains(body, `class="fail"`) {
+		t.Errorf("expected no fail checks in body, got:\n%s", body)
+	}
+}
+
+func TestHandleDoctor_graphFail(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgsErr: fmt.Errorf("token expired"),
+		evtsErr: fmt.Errorf("token expired"),
+	}
+	lc := fakeLLM{reply: "pong"}
+	srv := newDoctorServer(t, fakeAuth{authenticated: true}, gc, lc, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	// Graph mail and calendar should both fail
+	if strings.Count(body, `class="fail"`) < 2 {
+		t.Errorf("expected at least 2 fail checks for graph errors, got:\n%s", body)
+	}
+	if !strings.Contains(body, "token expired") {
+		t.Errorf("expected error detail in body, got:\n%s", body)
+	}
+}
+
+func TestHandleDoctor_notAuthenticated(t *testing.T) {
+	st := newMemStore(t)
+	srv := newDoctorServer(t, fakeAuth{authenticated: false}, fakeGraph{}, fakeLLM{reply: "pong"}, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "not authenticated") {
+		t.Errorf("expected 'not authenticated' detail for graph checks, got:\n%s", body)
+	}
+}
+
+func TestHandleDoctor_llmNotConfigured(t *testing.T) {
+	st := newMemStore(t)
+	srv := newDoctorServer(t, fakeAuth{authenticated: true}, fakeGraph{}, nil, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "not configured") {
+		t.Errorf("expected 'not configured' detail for LLM, got:\n%s", body)
+	}
+}
+
+func TestHandleDoctor_llmFail(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1"}},
+		events: []graph.Event{{ID: "e1"}},
+	}
+	lc := fakeLLM{err: fmt.Errorf("rate limit exceeded")}
+	srv := newDoctorServer(t, fakeAuth{authenticated: true}, gc, lc, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "rate limit exceeded") {
+		t.Errorf("expected error detail in body, got:\n%s", body)
 	}
 }

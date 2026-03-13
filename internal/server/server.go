@@ -17,6 +17,7 @@ import (
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 	"golang.org/x/oauth2"
 )
 
@@ -26,6 +27,17 @@ type authService interface {
 	IsAuthenticated(ctx context.Context) bool
 	AuthCodeURL(redirectURI string) (authURL, state, verifier string, err error)
 	ExchangeCode(ctx context.Context, code, verifier, redirectURI string) (*oauth2.Token, error)
+}
+
+// graphService is the subset of graph.Client used by the server.
+type graphService interface {
+	ListMessages(ctx context.Context, top int) ([]graph.Message, error)
+	ListEvents(ctx context.Context, top int) ([]graph.Event, error)
+}
+
+// llmService is the subset of llm.Client used by the server.
+type llmService interface {
+	Chat(ctx context.Context, messages []llm.Message) (string, error)
 }
 
 // Default system prompts. Used when no custom prompt is stored.
@@ -57,8 +69,8 @@ type Server struct {
 	cfg    *config.Config
 	mux    *http.ServeMux
 	auth   authService
-	client *graph.Client
-	llm    *llm.Client
+	client graphService
+	llm    llmService
 	store  *store.Store
 
 	pendingMu     sync.Mutex
@@ -72,9 +84,14 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 		mux:           http.NewServeMux(),
 		auth:          auth,
 		client:        client,
-		llm:           llmClient,
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
+	}
+	// Assign llmClient only when non-nil to preserve nil interface semantics.
+	// A typed nil (*llm.Client)(nil) assigned to an interface field would make
+	// the field non-nil, causing spurious "LLM not configured" paths to panic.
+	if llmClient != nil {
+		s.llm = llmClient
 	}
 	s.routes()
 	return s
@@ -202,13 +219,19 @@ type pageData struct {
 	FatalError string
 }
 
+// mdRenderer is a goldmark instance with GFM extensions (tables, strikethrough,
+// task lists, autolinks). Created once at startup; goldmark is concurrency-safe.
+var mdRenderer = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+)
+
 // renderMarkdown converts a markdown string to HTML. On error it falls back
 // to an escaped <pre> block.
-func renderMarkdown(md string) template.HTML {
+func renderMarkdown(src string) template.HTML {
 	var buf bytes.Buffer
-	if err := goldmark.Convert([]byte(md), &buf); err != nil {
+	if err := mdRenderer.Convert([]byte(src), &buf); err != nil {
 		log.Printf("goldmark: %v", err)
-		return template.HTML("<pre>" + template.HTMLEscapeString(md) + "</pre>") //nolint:gosec
+		return template.HTML("<pre>" + template.HTMLEscapeString(src) + "</pre>") //nolint:gosec
 	}
 	return template.HTML(buf.String()) //nolint:gosec // goldmark output is safe HTML
 }
@@ -739,8 +762,8 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		idx int
 		cr  checkResult
 	}
-	checks := make([]checkResult, 3)
-	ch := make(chan result, 3)
+	checks := make([]checkResult, 4)
+	ch := make(chan result, 4)
 
 	// Check 0: SQLite store
 	go func() {
@@ -766,9 +789,9 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		ch <- result{0, cr}
 	}()
 
-	// Check 1: Microsoft Graph API
+	// Check 1: Microsoft Graph — mail access
 	go func() {
-		cr := checkResult{Name: "Microsoft Graph"}
+		cr := checkResult{Name: "Graph (mail)"}
 		start := time.Now()
 		if !s.auth.IsAuthenticated(ctx) {
 			cr.Detail = "not authenticated — visit /login"
@@ -776,30 +799,46 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 			ch <- result{1, cr}
 			return
 		}
-		user, err := s.client.GetMe(ctx)
+		msgs, err := s.client.ListMessages(ctx, 1)
 		cr.Latency = time.Since(start)
 		if err != nil {
-			cr.Detail = fmt.Sprintf("GET /me failed: %v", err)
+			cr.Detail = fmt.Sprintf("ListMessages failed: %v", err)
 		} else {
 			cr.ok = true
-			name := user.DisplayName
-			addr := user.Mail
-			if addr == "" {
-				addr = user.UPN
-			}
-			cr.Detail = fmt.Sprintf("%s (%s)", name, addr)
+			cr.Detail = fmt.Sprintf("OK (%d message(s) accessible)", len(msgs))
 		}
 		ch <- result{1, cr}
 	}()
 
-	// Check 2: GitHub Copilot LLM
+	// Check 2: Microsoft Graph — calendar access
+	go func() {
+		cr := checkResult{Name: "Graph (calendar)"}
+		start := time.Now()
+		if !s.auth.IsAuthenticated(ctx) {
+			cr.Detail = "not authenticated — visit /login"
+			cr.Latency = time.Since(start)
+			ch <- result{2, cr}
+			return
+		}
+		events, err := s.client.ListEvents(ctx, 1)
+		cr.Latency = time.Since(start)
+		if err != nil {
+			cr.Detail = fmt.Sprintf("ListEvents failed: %v", err)
+		} else {
+			cr.ok = true
+			cr.Detail = fmt.Sprintf("OK (%d event(s) accessible)", len(events))
+		}
+		ch <- result{2, cr}
+	}()
+
+	// Check 3: GitHub Copilot LLM
 	go func() {
 		cr := checkResult{Name: "LLM (GitHub Copilot)"}
 		start := time.Now()
 		if s.llm == nil {
 			cr.Detail = "not configured — set GITHUB_TOKEN"
 			cr.Latency = time.Since(start)
-			ch <- result{2, cr}
+			ch <- result{3, cr}
 			return
 		}
 		_, err := s.llm.Chat(ctx, []llm.Message{
@@ -812,10 +851,10 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 			cr.ok = true
 			cr.Detail = "chat completion responded"
 		}
-		ch <- result{2, cr}
+		ch <- result{3, cr}
 	}()
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		r := <-ch
 		checks[r.idx] = r.cr
 	}
