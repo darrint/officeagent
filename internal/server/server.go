@@ -8,11 +8,13 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/darrint/officeagent/internal/config"
+	github "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
@@ -40,11 +42,17 @@ type llmService interface {
 	Chat(ctx context.Context, messages []llm.Message) (string, error)
 }
 
+// githubService is the subset of github.Client used by the server.
+type githubService interface {
+	ListRecentPRs(ctx context.Context, since time.Time, orgs []string) ([]github.PullRequest, error)
+}
+
 // Default system prompts. Used when no custom prompt is stored.
 const (
 	defaultOverallPrompt  = ""
 	defaultEmailPrompt    = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
 	defaultCalendarPrompt = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
+	defaultGitHubPrompt   = "You are a helpful engineering assistant. Give the user a concise summary of recent GitHub pull request activity across their team. Start with the overall picture: what is being worked on, what shipped, what is under review. Then highlight anything that specifically needs the user's attention — review requests, mentions, or their own open PRs awaiting feedback. Be friendly but brief."
 )
 
 // buildSystemPrompt assembles the final system prompt sent to the LLM.
@@ -77,19 +85,20 @@ type pendingLogin struct {
 
 // Server is the officeagent HTTP server.
 type Server struct {
-	cfg    *config.Config
-	mux    *http.ServeMux
-	auth   authService
-	client graphService
-	llm    llmService
-	store  *store.Store
+	cfg      *config.Config
+	mux      *http.ServeMux
+	auth     authService
+	client   graphService
+	llm      llmService
+	ghClient githubService
+	store    *store.Store
 
 	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
 }
 
 // New creates a new Server with routes registered.
-func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, st *store.Store) *Server {
+func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, ghClient *github.Client, st *store.Store) *Server {
 	s := &Server{
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
@@ -103,6 +112,10 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 	// the field non-nil, causing spurious "LLM not configured" paths to panic.
 	if llmClient != nil {
 		s.llm = llmClient
+	}
+	// Same pattern for ghClient.
+	if ghClient != nil {
+		s.ghClient = ghClient
 	}
 	s.routes()
 	return s
@@ -208,6 +221,21 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
     </form>
     {{end}}
   </div>
+  {{if or .GitHub.Error .GitHub.HTML}}
+  <div class="section">
+    <div class="section-title">GitHub PRs</div>
+    {{if .GitHub.Error}}<div class="error">{{.GitHub.Error}}</div>
+    {{else}}
+    <div class="card">{{.GitHub.HTML}}</div>
+    <form method="POST" action="/feedback" class="feedback">
+      <input type="hidden" name="section" value="github">
+      <button type="submit" name="rating" value="good" title="Helpful">👍</button>
+      <button type="submit" name="rating" value="bad" title="Needs improvement">👎</button>
+      <input type="text" name="note" placeholder="What should be different? (optional)" maxlength="300">
+    </form>
+    {{end}}
+  </div>
+  {{end}}
   <details>
     <summary>Raw JSON</summary>
     <pre>{{.RawJSON}}</pre>
@@ -226,6 +254,7 @@ type sectionData struct {
 type pageData struct {
 	Email      sectionData
 	Calendar   sectionData
+	GitHub     sectionData
 	RawJSON    string
 	FatalError string
 }
@@ -261,6 +290,70 @@ func (s *Server) getPrompt(key, defaultVal string) string {
 		return defaultVal
 	}
 	return val
+}
+
+// getSetting returns a non-prompt setting value from the store, or defaultVal.
+func (s *Server) getSetting(key, defaultVal string) string {
+	if s.store == nil {
+		return defaultVal
+	}
+	val, err := s.store.Get("setting." + key)
+	if err != nil {
+		log.Printf("store get setting.%s: %v", key, err)
+		return defaultVal
+	}
+	if val == "" {
+		return defaultVal
+	}
+	return val
+}
+
+// lastWorkDaySince returns midnight of the most recent work day before now.
+// If today is Monday it returns Friday; otherwise it returns yesterday,
+// skipping Saturday and Sunday.
+func lastWorkDaySince(now time.Time) time.Time {
+	day := now.Truncate(24 * time.Hour)
+	switch now.Weekday() {
+	case time.Monday:
+		day = day.AddDate(0, 0, -3) // Friday
+	default:
+		day = day.AddDate(0, 0, -1)
+		// Keep stepping back if we land on a weekend.
+		for day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
+			day = day.AddDate(0, 0, -1)
+		}
+	}
+	return day
+}
+
+// githubSince returns the time.Time to use as the "updated since" cutoff for
+// GitHub PR queries. Reads setting.github.lookback_days from the store;
+// "0" (or unset) means auto (last work day).
+func (s *Server) githubSince() time.Time {
+	raw := s.getSetting("github.lookback_days", "0")
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return lastWorkDaySince(time.Now())
+	}
+	return time.Now().AddDate(0, 0, -n)
+}
+
+// githubOrgs returns the list of GitHub org filters from settings.
+// Returns nil (meaning "all orgs") if the setting is empty.
+func (s *Server) githubOrgs() []string {
+	raw := strings.TrimSpace(s.getSetting("github.orgs", ""))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	orgs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			orgs = append(orgs, p)
+		}
+	}
+	return orgs
 }
 
 var settingsTmpl = template.Must(template.New("settings").Parse(`<!DOCTYPE html>
@@ -310,6 +403,21 @@ button:hover{background:#006cbd}
       <textarea id="calendar_prompt" name="calendar_prompt" rows="4">{{.CalendarPrompt}}</textarea>
       <p class="hint">This system prompt is sent to the LLM when summarizing your calendar.</p>
     </div>
+    <div class="card">
+      <label for="github_prompt">GitHub PR summary prompt</label>
+      <textarea id="github_prompt" name="github_prompt" rows="4">{{.GitHubPrompt}}</textarea>
+      <p class="hint">This system prompt is sent to the LLM when summarizing your recent GitHub PR activity.</p>
+    </div>
+    <div class="card">
+      <label for="github_lookback_days">GitHub lookback days</label>
+      <textarea id="github_lookback_days" name="github_lookback_days" rows="1">{{.GitHubLookbackDays}}</textarea>
+      <p class="hint">Number of days of PR activity to include. Set to 0 for auto (since last work day).</p>
+    </div>
+    <div class="card">
+      <label for="github_orgs">GitHub organizations (optional)</label>
+      <textarea id="github_orgs" name="github_orgs" rows="2">{{.GitHubOrgs}}</textarea>
+      <p class="hint">Comma-separated list of GitHub org names to filter PRs by. Leave blank to search all accessible repos.</p>
+    </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
       {{if .Saved}}<span class="saved">&#10003; Saved</span>{{end}}
@@ -320,10 +428,13 @@ button:hover{background:#006cbd}
 </html>`))
 
 type settingsData struct {
-	OverallPrompt  string
-	EmailPrompt    string
-	CalendarPrompt string
-	Saved          bool
+	OverallPrompt      string
+	EmailPrompt        string
+	CalendarPrompt     string
+	GitHubPrompt       string
+	GitHubLookbackDays string
+	GitHubOrgs         string
+	Saved              bool
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -332,10 +443,13 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := settingsData{
-		OverallPrompt:  s.getPrompt("overall", defaultOverallPrompt),
-		EmailPrompt:    s.getPrompt("email", defaultEmailPrompt),
-		CalendarPrompt: s.getPrompt("calendar", defaultCalendarPrompt),
-		Saved:          r.URL.Query().Get("saved") == "1",
+		OverallPrompt:      s.getPrompt("overall", defaultOverallPrompt),
+		EmailPrompt:        s.getPrompt("email", defaultEmailPrompt),
+		CalendarPrompt:     s.getPrompt("calendar", defaultCalendarPrompt),
+		GitHubPrompt:       s.getPrompt("github", defaultGitHubPrompt),
+		GitHubLookbackDays: s.getSetting("github.lookback_days", "0"),
+		GitHubOrgs:         s.getSetting("github.orgs", ""),
+		Saved:              r.URL.Query().Get("saved") == "1",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := settingsTmpl.Execute(w, data); err != nil {
@@ -355,6 +469,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	emailPrompt := strings.TrimSpace(r.FormValue("email_prompt"))
 	calPrompt := strings.TrimSpace(r.FormValue("calendar_prompt"))
 	overallPrompt := strings.TrimSpace(r.FormValue("overall_prompt"))
+	githubPrompt := strings.TrimSpace(r.FormValue("github_prompt"))
+	githubLookback := strings.TrimSpace(r.FormValue("github_lookback_days"))
+	githubOrgs := strings.TrimSpace(r.FormValue("github_orgs"))
 
 	if s.store != nil {
 		if err := s.store.Set("prompt.overall", overallPrompt); err != nil {
@@ -365,6 +482,15 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.store.Set("prompt.calendar", calPrompt); err != nil {
 			log.Printf("store set prompt.calendar: %v", err)
+		}
+		if err := s.store.Set("prompt.github", githubPrompt); err != nil {
+			log.Printf("store set prompt.github: %v", err)
+		}
+		if err := s.store.Set("setting.github.lookback_days", githubLookback); err != nil {
+			log.Printf("store set setting.github.lookback_days: %v", err)
+		}
+		if err := s.store.Set("setting.github.orgs", githubOrgs); err != nil {
+			log.Printf("store set setting.github.orgs: %v", err)
 		}
 	}
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
@@ -410,7 +536,7 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	rating := r.FormValue("rating")
 	note := strings.TrimSpace(r.FormValue("note"))
 
-	if section != "email" && section != "calendar" {
+	if section != "email" && section != "calendar" && section != "github" {
 		http.Error(w, "invalid section", http.StatusBadRequest)
 		return
 	}
@@ -455,9 +581,13 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 	type calResult struct {
 		section sectionData
 	}
+	type ghResult struct {
+		section sectionData
+	}
 
 	emailCh := make(chan emailResult, 1)
 	calCh := make(chan calResult, 1)
+	ghCh := make(chan ghResult, 1)
 
 	go func() {
 		msgs, err := s.client.ListMessages(r.Context(), 20)
@@ -530,17 +660,63 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		calCh <- calResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
 	}()
 
+	go func() {
+		if s.ghClient == nil {
+			ghCh <- ghResult{}
+			return
+		}
+		prs, err := s.ghClient.ListRecentPRs(r.Context(), s.githubSince(), s.githubOrgs())
+		if err != nil {
+			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}}
+			return
+		}
+		var sb strings.Builder
+		if len(prs) == 0 {
+			sb.WriteString("No recent pull request activity.")
+		} else {
+			for _, pr := range prs {
+				status := pr.State
+				if pr.MergedAt != nil {
+					status = "merged"
+				}
+				fmt.Fprintf(&sb, "- [%s#%d](%s) %s (%s) — updated %s\n",
+					pr.Repo, pr.Number, pr.HTMLURL, pr.Title,
+					status,
+					pr.UpdatedAt.In(easternLoc).Format("Mon Jan 2"),
+				)
+			}
+		}
+		reply, err := s.llm.Chat(r.Context(), []llm.Message{
+			{
+				Role: "system",
+				Content: buildSystemPrompt(
+					s.getPrompt("overall", defaultOverallPrompt),
+					s.getPrompt("github", defaultGitHubPrompt)+s.feedbackContext("github"),
+				),
+			},
+			{Role: "user", Content: "Here is my recent GitHub pull request activity:\n\n" + sb.String()},
+		})
+		if err != nil {
+			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("LLM error (github): %v", err)}}
+			return
+		}
+		ghCh <- ghResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
+	}()
+
 	emailRes := <-emailCh
 	calRes := <-calCh
+	ghRes := <-ghCh
 
 	rawJSON, _ := json.MarshalIndent(map[string]string{
 		"email":    emailRes.section.Raw,
 		"calendar": calRes.section.Raw,
+		"github":   ghRes.section.Raw,
 	}, "", "  ")
 
 	servePage(pageData{
 		Email:    emailRes.section,
 		Calendar: calRes.section,
+		GitHub:   ghRes.section,
 		RawJSON:  string(rawJSON),
 	})
 }

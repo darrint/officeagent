@@ -11,8 +11,10 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/darrint/officeagent/internal/config"
+	ghpkg "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
@@ -59,6 +61,16 @@ func (f fakeLLM) Chat(_ context.Context, _ []llm.Message) (string, error) {
 	return f.reply, f.err
 }
 
+// fakeGitHub implements githubService.
+type fakeGitHub struct {
+	prs []ghpkg.PullRequest
+	err error
+}
+
+func (f fakeGitHub) ListRecentPRs(_ context.Context, _ time.Time, _ []string) ([]ghpkg.PullRequest, error) {
+	return f.prs, f.err
+}
+
 // --- helpers ---
 
 // newTestServer builds a minimal Server for handler tests.
@@ -76,7 +88,6 @@ func newTestServer(t *testing.T, auth authService, st *store.Store) *Server {
 	s.routes()
 	return s
 }
-
 func newMemStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.New(":memory:")
@@ -462,5 +473,128 @@ func TestBuildSystemPrompt_bothEmpty(t *testing.T) {
 	got := buildSystemPrompt("", "")
 	if got != "" {
 		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+// --- lastWorkDaySince ---
+
+func TestLastWorkDaySince_monday(t *testing.T) {
+	// Monday → should return the previous Friday
+	mon := time.Date(2026, 3, 9, 9, 0, 0, 0, time.UTC) // Monday
+	got := lastWorkDaySince(mon)
+	if got.Weekday() != time.Friday {
+		t.Errorf("expected Friday, got %s", got.Weekday())
+	}
+	if got.Day() != 6 {
+		t.Errorf("expected day 6 (Fri Mar 6), got %d", got.Day())
+	}
+}
+
+func TestLastWorkDaySince_tuesday(t *testing.T) {
+	tue := time.Date(2026, 3, 10, 9, 0, 0, 0, time.UTC) // Tuesday
+	got := lastWorkDaySince(tue)
+	if got.Weekday() != time.Monday {
+		t.Errorf("expected Monday, got %s", got.Weekday())
+	}
+}
+
+func TestLastWorkDaySince_wednesday(t *testing.T) {
+	wed := time.Date(2026, 3, 11, 9, 0, 0, 0, time.UTC) // Wednesday
+	got := lastWorkDaySince(wed)
+	if got.Weekday() != time.Tuesday {
+		t.Errorf("expected Tuesday, got %s", got.Weekday())
+	}
+}
+
+// --- handleSummaryPage GitHub section ---
+
+func newSummaryServer(t *testing.T, auth authService, gc graphService, lc llmService, ghc githubService, st *store.Store) *Server {
+	t.Helper()
+	s := &Server{
+		cfg:           config.Default(),
+		mux:           http.NewServeMux(),
+		auth:          auth,
+		client:        gc,
+		llm:           lc,
+		ghClient:      ghc,
+		store:         st,
+		pendingLogins: make(map[string]pendingLogin),
+	}
+	s.routes()
+	return s
+}
+
+func TestHandleSummaryPage_githubSection(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	merged := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	ghc := fakeGitHub{prs: []ghpkg.PullRequest{
+		{Number: 42, Title: "Fix the bug", Repo: "acme/backend", State: "closed", MergedAt: &merged, UpdatedAt: merged},
+	}}
+	lc := fakeLLM{reply: "Here is your GitHub PR summary."}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "GitHub PRs") {
+		t.Errorf("expected GitHub PRs section heading in body")
+	}
+	if !strings.Contains(body, "GitHub PR summary") {
+		t.Errorf("expected LLM reply in GitHub section, body: %s", body)
+	}
+}
+
+func TestHandleSummaryPage_githubNotConfigured(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	lc := fakeLLM{reply: "summary"}
+	// ghClient is nil — GitHub section should not appear
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "GitHub PRs") {
+		t.Errorf("expected GitHub PRs section to be absent when ghClient is nil")
+	}
+}
+
+func TestHandleSummaryPage_githubError(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	ghc := fakeGitHub{err: fmt.Errorf("rate limit exceeded")}
+	lc := fakeLLM{reply: "summary"}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "rate limit exceeded") {
+		t.Errorf("expected error detail in body, got:\n%s", body)
 	}
 }

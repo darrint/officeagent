@@ -5,6 +5,7 @@ import (
 	_ "time/tzdata" // embed IANA timezone database for Windows
 
 	"github.com/darrint/officeagent/internal/config"
+	"github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/server"
@@ -31,13 +32,15 @@ func main() {
 	client := graph.NewClient(auth)
 
 	var llmClient *llm.Client
+	var ghClient *github.Client
 	if cfg.GitHubToken != "" {
 		llmClient = llm.NewClient(cfg.GitHubToken, cfg.LLMModel)
+		ghClient = github.NewClient(cfg.GitHubToken)
 	} else {
 		log.Println("warning: GITHUB_TOKEN not set, LLM features disabled")
 	}
 
-	srv := server.New(cfg, auth, client, llmClient, st)
+	srv := server.New(cfg, auth, client, llmClient, ghClient, st)
 	if err := srv.Run(); err != nil {
 		log.Fatal(err)
 	}
