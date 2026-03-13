@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/darrint/officeagent/internal/config"
+	"github.com/darrint/officeagent/internal/fastmail"
 	github "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
@@ -47,12 +48,18 @@ type githubService interface {
 	ListRecentPRs(ctx context.Context, since time.Time, orgs []string) ([]github.PullRequest, error)
 }
 
+// fastmailService is the subset of fastmail.Client used by the server.
+type fastmailService interface {
+	ListMessages(ctx context.Context, top int) ([]fastmail.Message, error)
+}
+
 // Default system prompts. Used when no custom prompt is stored.
 const (
-	defaultOverallPrompt  = ""
-	defaultEmailPrompt    = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
-	defaultCalendarPrompt = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
-	defaultGitHubPrompt   = "You are a helpful engineering assistant. Give the user a concise summary of recent GitHub pull request activity across their team. Start with the overall picture: what is being worked on, what shipped, what is under review. Then highlight anything that specifically needs the user's attention — review requests, mentions, or their own open PRs awaiting feedback. Be friendly but brief."
+	defaultOverallPrompt   = ""
+	defaultEmailPrompt     = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
+	defaultCalendarPrompt  = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
+	defaultGitHubPrompt    = "You are a helpful engineering assistant. Give the user a concise summary of recent GitHub pull request activity across their team. Start with the overall picture: what is being worked on, what shipped, what is under review. Then highlight anything that specifically needs the user's attention — review requests, mentions, or their own open PRs awaiting feedback. Be friendly but brief."
+	defaultFastmailPrompt  = "You are a helpful personal assistant. Give the user a concise summary of their recent personal inbox. Highlight anything that needs attention or action. Be friendly but brief."
 )
 
 // buildSystemPrompt assembles the final system prompt sent to the LLM.
@@ -91,6 +98,7 @@ type Server struct {
 	client   graphService
 	llm      llmService
 	ghClient githubService
+	fmClient fastmailService
 	store    *store.Store
 
 	clientMu      sync.RWMutex
@@ -110,6 +118,13 @@ func (s *Server) getGHClient() githubService {
 	s.clientMu.RLock()
 	defer s.clientMu.RUnlock()
 	return s.ghClient
+}
+
+// getFMClient returns the current Fastmail client, safe for concurrent use.
+func (s *Server) getFMClient() fastmailService {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
+	return s.fmClient
 }
 
 // effectiveGitHubToken returns the GitHub token to use: store value takes
@@ -135,24 +150,41 @@ func (s *Server) effectiveAzureClientID() string {
 	return s.cfg.AzureClientID
 }
 
-// reinitClients rebuilds the LLM and GitHub clients using the current effective
-// GitHub token. Called after the token is updated via the Settings page so that
-// new API calls use the updated credentials without requiring a server restart.
+// effectiveFastmailToken returns the Fastmail API token from the store.
+func (s *Server) effectiveFastmailToken() string {
+	if s.store != nil {
+		if v, err := s.store.Get("setting.fastmail_token"); err == nil && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// reinitClients rebuilds the LLM, GitHub, and Fastmail clients using current
+// effective tokens. Called after tokens are updated via the Settings page so
+// that new API calls use the updated credentials without requiring a server
+// restart.
 func (s *Server) reinitClients() {
-	tok := s.effectiveGitHubToken()
+	ghTok := s.effectiveGitHubToken()
+	fmTok := s.effectiveFastmailToken()
 	s.clientMu.Lock()
 	defer s.clientMu.Unlock()
-	if tok != "" {
-		s.llm = llm.NewClient(tok, s.cfg.LLMModel)
-		s.ghClient = github.NewClient(tok)
+	if ghTok != "" {
+		s.llm = llm.NewClient(ghTok, s.cfg.LLMModel)
+		s.ghClient = github.NewClient(ghTok)
 	} else {
 		s.llm = nil
 		s.ghClient = nil
 	}
+	if fmTok != "" {
+		s.fmClient = fastmail.NewClient(fmTok)
+	} else {
+		s.fmClient = nil
+	}
 }
 
 // New creates a new Server with routes registered.
-func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, ghClient *github.Client, st *store.Store) *Server {
+func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, ghClient *github.Client, fmClient *fastmail.Client, st *store.Store) *Server {
 	s := &Server{
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
@@ -167,9 +199,12 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 	if llmClient != nil {
 		s.llm = llmClient
 	}
-	// Same pattern for ghClient.
+	// Same pattern for ghClient and fmClient.
 	if ghClient != nil {
 		s.ghClient = ghClient
+	}
+	if fmClient != nil {
+		s.fmClient = fmClient
 	}
 	s.routes()
 	return s
@@ -305,6 +340,21 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
     {{end}}
   </div>
   {{end}}
+  {{if or .Fastmail.Error .Fastmail.HTML}}
+  <div class="section">
+    <div class="section-title">Personal Email (Fastmail)</div>
+    {{if .Fastmail.Error}}<div class="error">{{.Fastmail.Error}}</div>
+    {{else}}
+    <div class="card">{{.Fastmail.HTML}}</div>
+    <form method="POST" action="/feedback" class="feedback">
+      <input type="hidden" name="section" value="fastmail">
+      <button type="submit" name="rating" value="good" title="Helpful">👍</button>
+      <button type="submit" name="rating" value="bad" title="Needs improvement">👎</button>
+      <input type="text" name="note" placeholder="What should be different? (optional)" maxlength="300">
+    </form>
+    {{end}}
+  </div>
+  {{end}}
   <details>
     <summary>Raw JSON</summary>
     <pre>{{.RawJSON}}</pre>
@@ -329,6 +379,7 @@ type pageData struct {
 	Email       sectionData
 	Calendar    sectionData
 	GitHub      sectionData
+	Fastmail    sectionData
 	RawJSON     string
 	GeneratedAt string // empty = no cached report yet
 	FatalError  string
@@ -487,6 +538,11 @@ button:hover{background:#006cbd}
       <p class="hint">This system prompt is sent to the LLM when summarizing your recent GitHub PR activity.</p>
     </div>
     <div class="card">
+      <label for="fastmail_prompt">Fastmail summary prompt</label>
+      <textarea id="fastmail_prompt" name="fastmail_prompt" rows="4">{{.FastmailPrompt}}</textarea>
+      <p class="hint">This system prompt is sent to the LLM when summarizing your personal Fastmail inbox.</p>
+    </div>
+    <div class="card">
       <label for="github_lookback_days">GitHub lookback days</label>
       <textarea id="github_lookback_days" name="github_lookback_days" rows="1">{{.GitHubLookbackDays}}</textarea>
       <p class="hint">Number of days of PR activity to include. Set to 0 for auto (since last work day).</p>
@@ -500,6 +556,11 @@ button:hover{background:#006cbd}
       <label for="github_token">GitHub token{{if .GitHubTokenSet}}<span class="token-set">&#10003; Token is set</span>{{end}}</label>
       <input type="password" id="github_token" name="github_token" autocomplete="new-password" placeholder="Leave blank to keep existing token">
       <p class="hint">GitHub OAuth token with <code>copilot</code> scope, used for LLM and GitHub PR features. Run <code>gh auth login --scopes copilot</code> then <code>gh auth token</code> to obtain one. Never echoed back to the browser.</p>
+    </div>
+    <div class="card">
+      <label for="fastmail_token">Fastmail API token{{if .FastmailTokenSet}}<span class="token-set">&#10003; Token is set</span>{{end}}</label>
+      <input type="password" id="fastmail_token" name="fastmail_token" autocomplete="new-password" placeholder="Leave blank to keep existing token">
+      <p class="hint">Fastmail API token with mail scope for personal inbox summaries. Generate one at <code>app.fastmail.com/settings/security/tokens</code>. Never echoed back to the browser.</p>
     </div>
     <div class="card">
       <label for="azure_client_id">Azure application (client) ID</label>
@@ -520,9 +581,11 @@ type settingsData struct {
 	EmailPrompt        string
 	CalendarPrompt     string
 	GitHubPrompt       string
+	FastmailPrompt     string
 	GitHubLookbackDays string
 	GitHubOrgs         string
 	GitHubTokenSet     bool   // true if a GitHub token is stored (never echo the value)
+	FastmailTokenSet   bool   // true if a Fastmail token is stored (never echo the value)
 	AzureClientID      string // not a secret — can be shown in the UI
 	Saved              bool
 }
@@ -537,9 +600,11 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		EmailPrompt:        s.getPrompt("email", defaultEmailPrompt),
 		CalendarPrompt:     s.getPrompt("calendar", defaultCalendarPrompt),
 		GitHubPrompt:       s.getPrompt("github", defaultGitHubPrompt),
+		FastmailPrompt:     s.getPrompt("fastmail", defaultFastmailPrompt),
 		GitHubLookbackDays: s.getSetting("github.lookback_days", "0"),
 		GitHubOrgs:         s.getSetting("github.orgs", ""),
 		GitHubTokenSet:     s.effectiveGitHubToken() != "",
+		FastmailTokenSet:   s.effectiveFastmailToken() != "",
 		AzureClientID:      s.effectiveAzureClientID(),
 		Saved:              r.URL.Query().Get("saved") == "1",
 	}
@@ -562,9 +627,11 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	calPrompt := strings.TrimSpace(r.FormValue("calendar_prompt"))
 	overallPrompt := strings.TrimSpace(r.FormValue("overall_prompt"))
 	githubPrompt := strings.TrimSpace(r.FormValue("github_prompt"))
+	fastmailPrompt := strings.TrimSpace(r.FormValue("fastmail_prompt"))
 	githubLookback := strings.TrimSpace(r.FormValue("github_lookback_days"))
 	githubOrgs := strings.TrimSpace(r.FormValue("github_orgs"))
 	githubToken := strings.TrimSpace(r.FormValue("github_token"))
+	fastmailToken := strings.TrimSpace(r.FormValue("fastmail_token"))
 	azureClientID := strings.TrimSpace(r.FormValue("azure_client_id"))
 
 	if s.store != nil {
@@ -580,6 +647,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.Set("prompt.github", githubPrompt); err != nil {
 			log.Printf("store set prompt.github: %v", err)
 		}
+		if err := s.store.Set("prompt.fastmail", fastmailPrompt); err != nil {
+			log.Printf("store set prompt.fastmail: %v", err)
+		}
 		if err := s.store.Set("setting.github.lookback_days", githubLookback); err != nil {
 			log.Printf("store set setting.github.lookback_days: %v", err)
 		}
@@ -593,6 +663,13 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 				log.Printf("store set setting.github_token: %v", err)
 			}
 			// Rebuild LLM / GitHub clients immediately with the new token.
+			s.reinitClients()
+		}
+		// Same pattern for Fastmail token.
+		if fastmailToken != "" {
+			if err := s.store.Set("setting.fastmail_token", fastmailToken); err != nil {
+				log.Printf("store set setting.fastmail_token: %v", err)
+			}
 			s.reinitClients()
 		}
 		if azureClientID != "" {
@@ -644,7 +721,7 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	rating := r.FormValue("rating")
 	note := strings.TrimSpace(r.FormValue("note"))
 
-	if section != "email" && section != "calendar" && section != "github" {
+	if section != "email" && section != "calendar" && section != "github" && section != "fastmail" {
 		http.Error(w, "invalid section", http.StatusBadRequest)
 		return
 	}
@@ -697,12 +774,14 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		"email":    cached.EmailRaw,
 		"calendar": cached.CalendarRaw,
 		"github":   cached.GitHubRaw,
+		"fastmail": cached.FastmailRaw,
 	}, "", "  ")
 
 	servePage(pageData{
 		Email:       sectionDataFromCache(cached.EmailRaw, cached.EmailError),
 		Calendar:    sectionDataFromCache(cached.CalendarRaw, cached.CalendarError),
 		GitHub:      sectionDataFromCache(cached.GitHubRaw, cached.GitHubError),
+		Fastmail:    sectionDataFromCache(cached.FastmailRaw, cached.FastmailError),
 		RawJSON:     string(rawJSON),
 		GeneratedAt: cached.GeneratedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
 	})
@@ -722,13 +801,15 @@ func sectionDataFromCache(raw, errStr string) sectionData {
 // cachedReport is the serialised form of a generated morning briefing stored
 // in SQLite so that GET / can render without hitting any external APIs.
 type cachedReport struct {
-	EmailRaw      string    `json:"email_raw"`
-	CalendarRaw   string    `json:"calendar_raw"`
-	GitHubRaw     string    `json:"github_raw"`
-	EmailError    string    `json:"email_error,omitempty"`
-	CalendarError string    `json:"calendar_error,omitempty"`
-	GitHubError   string    `json:"github_error,omitempty"`
-	GeneratedAt   time.Time `json:"generated_at"`
+	EmailRaw       string    `json:"email_raw"`
+	CalendarRaw    string    `json:"calendar_raw"`
+	GitHubRaw      string    `json:"github_raw"`
+	FastmailRaw    string    `json:"fastmail_raw,omitempty"`
+	EmailError     string    `json:"email_error,omitempty"`
+	CalendarError  string    `json:"calendar_error,omitempty"`
+	GitHubError    string    `json:"github_error,omitempty"`
+	FastmailError  string    `json:"fastmail_error,omitempty"`
+	GeneratedAt    time.Time `json:"generated_at"`
 }
 
 const reportStoreKey = "report.last"
@@ -781,10 +862,12 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	type emailResult struct{ section sectionData }
 	type calResult struct{ section sectionData }
 	type ghResult struct{ section sectionData }
+	type fmResult struct{ section sectionData }
 
 	emailCh := make(chan emailResult, 1)
 	calCh := make(chan calResult, 1)
 	ghCh := make(chan ghResult, 1)
+	fmCh := make(chan fmResult, 1)
 
 	go func() {
 		msgs, err := s.client.ListMessages(r.Context(), 20)
@@ -900,17 +983,61 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		ghCh <- ghResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
 	}()
 
+	go func() {
+		fmC := s.getFMClient()
+		if fmC == nil {
+			fmCh <- fmResult{}
+			return
+		}
+		msgs, err := fmC.ListMessages(r.Context(), 20)
+		if err != nil {
+			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}}
+			return
+		}
+		var sb strings.Builder
+		if len(msgs) == 0 {
+			sb.WriteString("No recent messages.")
+		} else {
+			for _, m := range msgs {
+				fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
+					m.From,
+					m.Subject,
+					m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+					m.BodyPreview,
+				)
+			}
+		}
+		reply, err := llmC.Chat(r.Context(), []llm.Message{
+			{
+				Role: "system",
+				Content: buildSystemPrompt(
+					s.getPrompt("overall", defaultOverallPrompt),
+					s.getPrompt("fastmail", defaultFastmailPrompt)+s.feedbackContext("fastmail"),
+				),
+			},
+			{Role: "user", Content: "Here are my recent personal emails:\n\n" + sb.String()},
+		})
+		if err != nil {
+			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}}
+			return
+		}
+		fmCh <- fmResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
+	}()
+
 	emailRes := <-emailCh
 	calRes := <-calCh
 	ghRes := <-ghCh
+	fmRes := <-fmCh
 
 	rep := &cachedReport{
 		EmailRaw:      emailRes.section.Raw,
 		CalendarRaw:   calRes.section.Raw,
 		GitHubRaw:     ghRes.section.Raw,
+		FastmailRaw:   fmRes.section.Raw,
 		EmailError:    emailRes.section.Error,
 		CalendarError: calRes.section.Error,
 		GitHubError:   ghRes.section.Error,
+		FastmailError: fmRes.section.Error,
 		GeneratedAt:   time.Now().UTC(),
 	}
 	if err := s.saveLastReport(rep); err != nil {
@@ -1003,6 +1130,23 @@ footer a:hover{color:#0078d4}
     </div>
   </div>
 
+  <div class="divider">Personal Email</div>
+
+  <div class="service">
+    <div class="service-info">
+      <div class="service-name">Fastmail</div>
+      <div class="service-desc">Personal inbox summaries via Fastmail JMAP API</div>
+      {{if .FastmailToken}}
+      <span class="badge badge-ok">&#10003; Token configured</span>
+      {{else}}
+      <span class="badge badge-warn">&#9888; Token not set (optional)</span>
+      {{end}}
+    </div>
+    <div class="action">
+      <a href="/settings#fastmail_token">{{if .FastmailToken}}Update token{{else}}Configure in Settings{{end}}</a>
+    </div>
+  </div>
+
   <footer><a href="/doctor">Technical diagnostics →</a></footer>
 </div>
 </body>
@@ -1012,6 +1156,7 @@ type connectData struct {
 	MSGraphAuth     bool // authenticated with Microsoft Graph
 	MSGraphClientID bool // Azure client ID is configured
 	GitHubToken     bool // GitHub token is configured
+	FastmailToken   bool // Fastmail API token is configured
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -1019,6 +1164,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		MSGraphAuth:     s.auth.IsAuthenticated(r.Context()),
 		MSGraphClientID: s.effectiveAzureClientID() != "",
 		GitHubToken:     s.effectiveGitHubToken() != "",
+		FastmailToken:   s.effectiveFastmailToken() != "",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := connectTmpl.Execute(w, data); err != nil {
@@ -1228,15 +1374,19 @@ tr:last-child td{border-bottom:none}
 </html>`))
 
 type checkResult struct {
-	Name       string
-	ok         bool
-	Detail     string
-	Latency    time.Duration
+	Name    string
+	ok      bool
+	warn    bool // optional check; not a failure if unconfigured
+	Detail  string
+	Latency time.Duration
 }
 
 func (c checkResult) Status() string {
 	if c.ok {
 		return "OK"
+	}
+	if c.warn {
+		return "WARN"
 	}
 	return "FAIL"
 }
@@ -1245,12 +1395,18 @@ func (c checkResult) StatusClass() string {
 	if c.ok {
 		return "ok"
 	}
+	if c.warn {
+		return "warn"
+	}
 	return "fail"
 }
 
 func (c checkResult) StatusIcon() string {
 	if c.ok {
 		return "✓"
+	}
+	if c.warn {
+		return "⚠"
 	}
 	return "✗"
 }
@@ -1273,8 +1429,8 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		idx int
 		cr  checkResult
 	}
-	checks := make([]checkResult, 4)
-	ch := make(chan result, 4)
+	checks := make([]checkResult, 5)
+	ch := make(chan result, 5)
 
 	// Check 0: SQLite store
 	go func() {
@@ -1366,7 +1522,30 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		ch <- result{3, cr}
 	}()
 
-	for i := 0; i < 4; i++ {
+	// Check 4: Fastmail JMAP
+	go func() {
+		cr := checkResult{Name: "Fastmail (JMAP)"}
+		start := time.Now()
+		fmC := s.getFMClient()
+		if fmC == nil {
+			cr.warn = true
+			cr.Detail = "not configured — add Fastmail token via Settings (optional)"
+			cr.Latency = time.Since(start)
+			ch <- result{4, cr}
+			return
+		}
+		msgs, err := fmC.ListMessages(ctx, 1)
+		cr.Latency = time.Since(start)
+		if err != nil {
+			cr.Detail = fmt.Sprintf("ListMessages failed: %v", err)
+		} else {
+			cr.ok = true
+			cr.Detail = fmt.Sprintf("OK (%d message(s) accessible)", len(msgs))
+		}
+		ch <- result{4, cr}
+	}()
+
+	for i := 0; i < 5; i++ {
 		r := <-ch
 		checks[r.idx] = r.cr
 	}

@@ -5,6 +5,7 @@ import (
 	_ "time/tzdata" // embed IANA timezone database for Windows
 
 	"github.com/darrint/officeagent/internal/config"
+	"github.com/darrint/officeagent/internal/fastmail"
 	"github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
@@ -49,7 +50,12 @@ func main() {
 		log.Println("warning: GITHUB_TOKEN not set and no token in settings — LLM features disabled; add token via Settings page")
 	}
 
-	srv := server.New(cfg, auth, client, llmClient, ghClient, st)
+	var fmClient *fastmail.Client
+	if v, err := st.Get("setting.fastmail_token"); err == nil && v != "" {
+		fmClient = fastmail.NewClient(v)
+	}
+
+	srv := server.New(cfg, auth, client, llmClient, ghClient, fmClient, st)
 	if err := srv.Run(); err != nil {
 		log.Fatal(err)
 	}
