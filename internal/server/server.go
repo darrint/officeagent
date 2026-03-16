@@ -1426,21 +1426,16 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	}()
 }
 
-// nextSevenAM returns the next 7:00 AM occurrence in the given local time.
-// If now is before 7:15 AM today, it returns today at 7:00 AM; otherwise
-// it returns tomorrow at 7:00 AM.
+// nextSevenAM returns the next 7:00 AM occurrence strictly in the future
+// relative to now. If now is before 7:00 AM today, it returns today at
+// 7:00 AM; otherwise it returns tomorrow at 7:00 AM.
 func nextSevenAM(now time.Time) time.Time {
 	y, mo, d := now.Date()
 	loc := now.Location()
 	today7 := time.Date(y, mo, d, 7, 0, 0, 0, loc)
-	// If current time is within the 7:00–7:15 window or before, use today.
-	if now.Before(today7.Add(15 * time.Minute)) {
-		if now.Before(today7) {
-			return today7
-		}
-		return today7 // still within window — fire immediately on next tick
+	if now.Before(today7) {
+		return today7
 	}
-	// Already past 7:15 AM — target tomorrow.
 	return today7.AddDate(0, 0, 1)
 }
 
