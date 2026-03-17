@@ -84,6 +84,7 @@ func newTestServer(t *testing.T, auth authService, st *store.Store) *Server {
 		client:        fakeGraph{},
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
+		progress:      newProgressBus(),
 	}
 	s.routes()
 	return s
@@ -519,6 +520,7 @@ func newSummaryServer(t *testing.T, auth authService, gc graphService, lc llmSer
 		ghClient:      ghc,
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
+		progress:      newProgressBus(),
 	}
 	s.routes()
 	return s
@@ -547,7 +549,9 @@ func TestHandleSummaryPage_emptyState(t *testing.T) {
 }
 
 func TestHandleGenerate_storesAndRedirects(t *testing.T) {
-	// POST /generate → fetches, stores, redirects to /; GET / renders from cache.
+	// POST /generate → kicks off background generation, redirects to /generating.
+	// We then call GenerateBriefing directly to populate the cache and verify
+	// that GET / renders from it.
 	st := newMemStore(t)
 	gc := fakeGraph{
 		msgs:   []graph.Message{{ID: "m1", Subject: "Hello"}},
@@ -556,7 +560,7 @@ func TestHandleGenerate_storesAndRedirects(t *testing.T) {
 	lc := fakeLLM{reply: "LLM summary"}
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
 
-	// Trigger generation.
+	// Trigger generation via HTTP — should redirect to /generating.
 	req := httptest.NewRequest(http.MethodPost, "/generate", nil)
 	w := httptest.NewRecorder()
 	srv.mux.ServeHTTP(w, req)
@@ -564,8 +568,13 @@ func TestHandleGenerate_storesAndRedirects(t *testing.T) {
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303 redirect after generate, got %d", w.Code)
 	}
-	if w.Header().Get("Location") != "/" {
-		t.Errorf("expected redirect to /, got %s", w.Header().Get("Location"))
+	if w.Header().Get("Location") != "/generating" {
+		t.Errorf("expected redirect to /generating, got %s", w.Header().Get("Location"))
+	}
+
+	// Populate the cache synchronously so we can test GET / without races.
+	if _, err := srv.GenerateBriefing(context.Background()); err != nil {
+		t.Fatalf("GenerateBriefing: %v", err)
 	}
 
 	// GET / should now show the cached report.
@@ -599,17 +608,18 @@ func TestHandleGenerate_pageRefreshDoesNotRegenerate(t *testing.T) {
 	lc := &callCountLLM{reply: "LLM summary", counter: &calls}
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
 
-	// One generate.
-	req := httptest.NewRequest(http.MethodPost, "/generate", nil)
-	srv.mux.ServeHTTP(httptest.NewRecorder(), req)
+	// One generate (synchronous, to populate the cache reliably).
+	if _, err := srv.GenerateBriefing(context.Background()); err != nil {
+		t.Fatalf("GenerateBriefing: %v", err)
+	}
+	callsAfterGenerate := calls
 
 	// Three page loads — should not increase call count.
 	for i := 0; i < 3; i++ {
 		srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	}
-	// The LLM was called once (email) + once (calendar) = 2 during generate; no more.
-	if calls > 2 {
-		t.Errorf("expected at most 2 LLM calls (one per section during generate), got %d", calls)
+	if calls != callsAfterGenerate {
+		t.Errorf("expected no additional LLM calls on page loads, got %d extra", calls-callsAfterGenerate)
 	}
 }
 
@@ -627,7 +637,7 @@ func TestHandleSummaryPage_githubSection(t *testing.T) {
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
 
 	// Generate first.
-	srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/generate", nil))
+	_, _ = srv.GenerateBriefing(context.Background())
 
 	// Now GET / should show the GitHub section.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -655,7 +665,7 @@ func TestHandleSummaryPage_githubNotConfigured(t *testing.T) {
 	lc := fakeLLM{reply: "summary"}
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
 
-	srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/generate", nil))
+	_, _ = srv.GenerateBriefing(context.Background())
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
@@ -679,7 +689,7 @@ func TestHandleSummaryPage_githubError(t *testing.T) {
 	lc := fakeLLM{reply: "summary"}
 	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
 
-	srv.mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/generate", nil))
+	_, _ = srv.GenerateBriefing(context.Background())
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()

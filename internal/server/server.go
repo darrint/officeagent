@@ -121,6 +121,50 @@ type pendingLogin struct {
 	expiry   time.Time
 }
 
+// progressEvent is a named step emitted during briefing generation.
+type progressEvent struct {
+	Step    string // e.g. "email:fetch", "email:llm", "done", "error"
+	Message string // human-readable status line
+}
+
+// progressBus fans out progress events to all connected SSE clients.
+type progressBus struct {
+	mu      sync.Mutex
+	clients map[chan progressEvent]struct{}
+}
+
+func newProgressBus() *progressBus {
+	return &progressBus{clients: make(map[chan progressEvent]struct{})}
+}
+
+// subscribe registers a new SSE client and returns its channel.
+func (b *progressBus) subscribe() chan progressEvent {
+	ch := make(chan progressEvent, 16)
+	b.mu.Lock()
+	b.clients[ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
+}
+
+// unsubscribe removes a client channel.
+func (b *progressBus) unsubscribe(ch chan progressEvent) {
+	b.mu.Lock()
+	delete(b.clients, ch)
+	b.mu.Unlock()
+}
+
+// publish sends an event to all current subscribers (non-blocking per client).
+func (b *progressBus) publish(ev progressEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.clients {
+		select {
+		case ch <- ev:
+		default: // drop if client is too slow
+		}
+	}
+}
+
 // Server is the officeagent HTTP server.
 type Server struct {
 	cfg      *config.Config
@@ -135,6 +179,8 @@ type Server struct {
 	clientMu      sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
+
+	progress *progressBus // SSE fan-out for briefing generation progress
 }
 
 // getLLM returns the current LLM client, safe for concurrent use.
@@ -234,6 +280,7 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 		client:        client,
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
+		progress:      newProgressBus(),
 	}
 	// Assign llmClient only when non-nil to preserve nil interface semantics.
 	// A typed nil (*llm.Client)(nil) assigned to an interface field would make
@@ -255,6 +302,8 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleSummaryPage)
 	s.mux.HandleFunc("POST /generate", s.handleGenerate)
+	s.mux.HandleFunc("GET /generating", s.handleGeneratingPage)
+	s.mux.HandleFunc("GET /generate/progress", s.handleGenerateProgress)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /connect", s.handleConnect)
 	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
@@ -330,16 +379,12 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 .empty-state button:disabled{background:#99c0e8;cursor:not-allowed}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:.85em;height:.85em;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:.35em}
-#gen-loading-bar{position:fixed;top:0;left:0;height:3px;background:#0078d4;width:0;transition:width .3s ease;z-index:9999}
 </style>
 <script>
-function startGenerate(btn) {
-  var bar = document.getElementById('gen-loading-bar');
-  if (bar) { bar.style.width = '70%'; }
-  setTimeout(function() {
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Generating\u2026';
-  }, 0);
+function startGenerate() {
+  fetch('/generate', {method:'POST', redirect:'follow'})
+    .then(function(r) { window.location.href = r.url; })
+    .catch(function() { window.location.href = '/generating'; });
 }
 function archiveLowPrio() {
   var btn = document.getElementById('archive-btn');
@@ -386,7 +431,6 @@ function sendReport() {
 </script>
 </head>
 <body>
-<div id="gen-loading-bar"></div>
 <div class="wrap">
   <header>
     <h1>officeagent</h1>
@@ -399,7 +443,7 @@ function sendReport() {
   {{else if .GeneratedAt}}
   <div class="gen-bar">
     <span>Generated {{.GeneratedAt}}</span>
-    <form method="POST" action="/generate"><button type="submit" onclick="startGenerate(this)">Regenerate</button></form>
+    <button type="button" onclick="startGenerate()">Regenerate</button>
     <button type="button" id="archive-btn" onclick="archiveLowPrio()">Move Low-Priority Mail</button>
     <button type="button" id="send-report-btn" onclick="sendReport()" style="background:#107c10">Send Now</button>
   </div>
@@ -467,7 +511,7 @@ function sendReport() {
   {{else}}
   <div class="empty-state">
     <p>No briefing generated yet.</p>
-    <form method="POST" action="/generate"><button type="submit" onclick="startGenerate(this)">Generate Briefing</button></form>
+    <button type="button" onclick="startGenerate()">Generate Briefing</button>
   </div>
   {{end}}
 </div>
@@ -1199,7 +1243,12 @@ func (s *Server) saveLastReport(rep *cachedReport) error {
 // GenerateBriefing fetches data from all configured sources, asks the LLM for
 // summaries of each section, saves the result to the store, and returns it.
 // It is safe to call from background goroutines (uses the supplied context).
+// Progress events are published to s.progress throughout execution.
 func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
+	emit := func(step, msg string) {
+		s.progress.publish(progressEvent{Step: step, Message: msg})
+	}
+
 	llmC := s.getLLM()
 	ghC := s.getGHClient()
 	if llmC == nil {
@@ -1217,11 +1266,14 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	fmCh := make(chan fmResult, 1)
 
 	go func() {
+		emit("email:fetch", "Fetching work email...")
 		msgs, err := s.client.ListMessages(ctx, 20)
 		if err != nil {
+			emit("email:error", fmt.Sprintf("Email fetch failed: %v", err))
 			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}}
 			return
 		}
+		emit("email:llm", fmt.Sprintf("Summarising %d email(s) with AI...", len(msgs)))
 		var sb strings.Builder
 		if len(msgs) == 0 {
 			sb.WriteString("No recent messages.")
@@ -1246,18 +1298,23 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 			{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
 		})
 		if err != nil {
+			emit("email:error", fmt.Sprintf("Email AI summary failed: %v", err))
 			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}}
 			return
 		}
+		emit("email:done", "Work email summary ready.")
 		emailCh <- emailResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
 	}()
 
 	go func() {
+		emit("calendar:fetch", "Fetching calendar events...")
 		events, err := s.client.ListEvents(ctx, 20)
 		if err != nil {
+			emit("calendar:error", fmt.Sprintf("Calendar fetch failed: %v", err))
 			calCh <- calResult{sectionData{Error: fmt.Sprintf("Failed to fetch calendar: %v", err)}}
 			return
 		}
+		emit("calendar:llm", fmt.Sprintf("Summarising %d event(s) with AI...", len(events)))
 		var sb strings.Builder
 		if len(events) == 0 {
 			sb.WriteString("No upcoming events.")
@@ -1281,22 +1338,28 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 			{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
 		})
 		if err != nil {
+			emit("calendar:error", fmt.Sprintf("Calendar AI summary failed: %v", err))
 			calCh <- calResult{sectionData{Error: fmt.Sprintf("LLM error (calendar): %v", err)}}
 			return
 		}
+		emit("calendar:done", "Calendar summary ready.")
 		calCh <- calResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
 	}()
 
 	go func() {
 		if ghC == nil {
+			emit("github:skip", "GitHub not configured, skipping.")
 			ghCh <- ghResult{}
 			return
 		}
+		emit("github:fetch", "Fetching GitHub PRs...")
 		prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs(), s.githubUsername())
 		if err != nil {
+			emit("github:error", fmt.Sprintf("GitHub fetch failed: %v", err))
 			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}}
 			return
 		}
+		emit("github:llm", fmt.Sprintf("Summarising %d PR(s) with AI...", len(prs)))
 		var sb strings.Builder
 		if len(prs) == 0 {
 			sb.WriteString("No recent pull request activity.")
@@ -1370,23 +1433,29 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 			{Role: "user", Content: "Here is my recent GitHub pull request activity:\n\n" + sb.String()},
 		})
 		if err != nil {
+			emit("github:error", fmt.Sprintf("GitHub AI summary failed: %v", err))
 			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("LLM error (github): %v", err)}}
 			return
 		}
+		emit("github:done", "GitHub PR summary ready.")
 		ghCh <- ghResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
 	}()
 
 	go func() {
 		fmC := s.getFMClient()
 		if fmC == nil {
+			emit("fastmail:skip", "Fastmail not configured, skipping.")
 			fmCh <- fmResult{}
 			return
 		}
+		emit("fastmail:fetch", "Fetching Fastmail inbox...")
 		msgs, err := fmC.ListMessages(ctx, 20)
 		if err != nil {
+			emit("fastmail:error", fmt.Sprintf("Fastmail fetch failed: %v", err))
 			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}}
 			return
 		}
+		emit("fastmail:llm", fmt.Sprintf("Summarising %d personal email(s) with AI...", len(msgs)))
 		var sb strings.Builder
 		if len(msgs) == 0 {
 			sb.WriteString("No recent messages.")
@@ -1411,9 +1480,11 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 			{Role: "user", Content: "Here are my recent personal emails:\n\n" + sb.String()},
 		})
 		if err != nil {
+			emit("fastmail:error", fmt.Sprintf("Fastmail AI summary failed: %v", err))
 			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}}
 			return
 		}
+		emit("fastmail:done", "Personal email summary ready.")
 		fmCh <- fmResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
 	}()
 
@@ -1436,6 +1507,7 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	if err := s.saveLastReport(rep); err != nil {
 		log.Printf("save last report: %v", err)
 	}
+	emit("done", "Briefing complete.")
 	return rep, nil
 }
 
@@ -1526,6 +1598,135 @@ func nextSevenAM(now time.Time) time.Time {
 	return today7.AddDate(0, 0, 1)
 }
 
+// generatingTmpl is the page shown while briefing generation is in progress.
+// It opens an EventSource to /generate/progress and updates a live step list.
+var generatingTmpl = template.Must(template.New("generating").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>officeagent — Generating…</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2rem 1rem;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
+header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
+header span{font-size:.85rem;color:#666;flex:1}
+.card{background:#fff;border-radius:10px;padding:1.75rem 2rem;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+h2{font-size:1.05rem;margin-bottom:1.25rem;color:#0078d4}
+#steps{list-style:none;padding:0;margin:0}
+#steps li{display:flex;align-items:flex-start;gap:.75rem;padding:.45rem 0;border-bottom:1px solid #f0f0f0;font-size:.9rem}
+#steps li:last-child{border-bottom:none}
+.icon{flex-shrink:0;width:1.1em;text-align:center}
+.msg{flex:1;color:#333}
+.spin{display:inline-block;width:.85em;height:.85em;border:2px solid rgba(0,120,212,.25);border-top-color:#0078d4;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+#progress-bar{height:4px;background:#0078d4;width:0;transition:width .4s ease;border-radius:2px;margin-bottom:1.5rem}
+#status-line{font-size:.82rem;color:#888;margin-top:1.25rem}
+.done-icon{color:#107c10}
+.error-icon{color:#c00}
+.skip-icon{color:#aaa}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>officeagent</h1>
+    <span>generating briefing…</span>
+  </header>
+  <div id="progress-bar"></div>
+  <div class="card">
+    <h2>Generating your morning briefing</h2>
+    <ul id="steps"></ul>
+    <div id="status-line">Connecting…</div>
+  </div>
+</div>
+<script>
+(function() {
+  var steps = document.getElementById('steps');
+  var bar = document.getElementById('progress-bar');
+  var statusLine = document.getElementById('status-line');
+
+  // Progress bar milestones keyed by step prefix.
+  var barSteps = {
+    'email:fetch': 5, 'email:llm': 15, 'email:done': 25, 'email:error': 25,
+    'calendar:fetch': 30, 'calendar:llm': 40, 'calendar:done': 50, 'calendar:error': 50,
+    'github:fetch': 55, 'github:llm': 65, 'github:done': 75, 'github:error': 75, 'github:skip': 75,
+    'fastmail:fetch': 80, 'fastmail:llm': 88, 'fastmail:done': 96, 'fastmail:error': 96, 'fastmail:skip': 96,
+    'done': 100, 'error': 100
+  };
+
+  function icon(step) {
+    if (step.endsWith(':done')) return '<span class="icon done-icon">&#10003;</span>';
+    if (step.endsWith(':error')) return '<span class="icon error-icon">&#10007;</span>';
+    if (step.endsWith(':skip')) return '<span class="icon skip-icon">&#8212;</span>';
+    if (step === 'done') return '<span class="icon done-icon">&#10003;</span>';
+    if (step === 'error') return '<span class="icon error-icon">&#10007;</span>';
+    return '<span class="icon"><span class="spin"></span></span>';
+  }
+
+  // Track live (in-progress) list items so we can update them to done/error.
+  var liveItems = {};
+
+  function addStep(step, msg) {
+    var sectionPrefix = step.split(':')[0];
+    // If we already have a live item for this section, update it in-place.
+    if (liveItems[sectionPrefix] && !step.endsWith(':fetch')) {
+      var li = liveItems[sectionPrefix];
+      li.querySelector('.icon').outerHTML = icon(step);
+      li.querySelector('.msg').textContent = msg;
+      if (step.endsWith(':done') || step.endsWith(':error') || step.endsWith(':skip') || step === 'done' || step === 'error') {
+        delete liveItems[sectionPrefix];
+      }
+      return;
+    }
+    var li = document.createElement('li');
+    li.innerHTML = icon(step) + '<span class="msg">' + msg + '</span>';
+    steps.appendChild(li);
+    if (!step.endsWith(':done') && !step.endsWith(':error') && !step.endsWith(':skip') && step !== 'done' && step !== 'error') {
+      liveItems[sectionPrefix] = li;
+    }
+  }
+
+  var src = new EventSource('/generate/progress');
+
+  src.onopen = function() {
+    statusLine.textContent = 'Connected. Waiting for first step…';
+  };
+
+  src.onmessage = function(e) {
+    var ev;
+    try { ev = JSON.parse(e.data); } catch(_) { return; }
+    addStep(ev.Step, ev.Message);
+    var pct = barSteps[ev.Step];
+    if (pct !== undefined) { bar.style.width = pct + '%'; }
+    statusLine.textContent = ev.Message;
+    if (ev.Step === 'done') {
+      statusLine.textContent = 'Done! Redirecting…';
+      src.close();
+      setTimeout(function(){ window.location.href = '/'; }, 700);
+    } else if (ev.Step === 'error') {
+      statusLine.textContent = 'Generation failed. Redirecting…';
+      src.close();
+      setTimeout(function(){ window.location.href = '/'; }, 1500);
+    }
+  };
+
+  src.onerror = function() {
+    // If the SSE stream closes (server closed it normally after 'done'),
+    // the browser fires onerror. Only treat it as a real error if we haven't
+    // already received 'done'.
+    if (bar.style.width === '100%') return;
+    statusLine.textContent = 'Lost connection. Redirecting to briefing…';
+    src.close();
+    setTimeout(function(){ window.location.href = '/'; }, 1000);
+  };
+})();
+</script>
+</body>
+</html>`))
+
 func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if !s.auth.IsAuthenticated(r.Context()) {
 		http.Redirect(w, r, "/login", http.StatusFound)
@@ -1535,10 +1736,77 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if _, err := s.GenerateBriefing(r.Context()); err != nil {
-		log.Printf("handleGenerate: %v", err)
+	// Launch generation in the background so the browser can navigate to the
+	// progress page immediately. Use a detached context so cancelling the
+	// request doesn't abort generation.
+	go func() {
+		if _, err := s.GenerateBriefing(context.Background()); err != nil {
+			log.Printf("handleGenerate (background): %v", err)
+			s.progress.publish(progressEvent{Step: "error", Message: fmt.Sprintf("Generation failed: %v", err)})
+		}
+	}()
+	http.Redirect(w, r, "/generating", http.StatusSeeOther)
+}
+
+// handleGeneratingPage serves the progress page shown while a briefing is
+// being generated. It uses an EventSource to receive SSE events from
+// /generate/progress and auto-redirects to / when done.
+func (s *Server) handleGeneratingPage(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := generatingTmpl.Execute(w, nil); err != nil {
+		log.Printf("generating template: %v", err)
+	}
+}
+
+// handleGenerateProgress is the SSE endpoint that streams progress events while
+// a briefing is being generated.
+func (s *Server) handleGenerateProgress(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ch := s.progress.subscribe()
+	defer s.progress.unsubscribe(ch)
+
+	// Send a keepalive comment immediately so the browser knows the connection
+	// is alive.
+	_, _ = fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			// Encode message as JSON so the client can parse step + message.
+			payload, _ := json.Marshal(ev)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+			flusher.Flush()
+			// Close the SSE stream after the terminal events so the client
+			// can do its redirect without waiting for a timeout.
+			if ev.Step == "done" || ev.Step == "error" {
+				return
+			}
+		}
+	}
 }
 
 // handleSendReport handles POST /send-report — triggers an immediate ntfy send.
