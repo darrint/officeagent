@@ -68,23 +68,20 @@ type searchResponse struct {
 //
 // When orgs is non-empty, one query per org is issued for ALL pull requests in
 // those orgs (not filtered to the authenticated user), giving a full picture of
-// team activity. When orgs is empty, the query falls back to PRs involving the
+// team activity. When username is non-empty, an additional user:<login> query
+// is issued so personal repos are always included alongside org results. When
+// both orgs and username are empty, the query falls back to PRs involving the
 // authenticated user (involves:@me) since searching all of GitHub is not useful.
-func (c *Client) ListRecentPRs(ctx context.Context, since time.Time, orgs []string) ([]PullRequest, error) {
+func (c *Client) ListRecentPRs(ctx context.Context, since time.Time, orgs []string, username string) ([]PullRequest, error) {
 	dateStr := since.UTC().Format("2006-01-02")
-	if len(orgs) == 0 {
-		// No org filter: scope to the authenticated user's activity.
+	if len(orgs) == 0 && username == "" {
+		// No org filter and no username: scope to the authenticated user's activity.
 		return c.search(ctx, fmt.Sprintf("type:pr involves:@me updated:>%s", dateStr))
 	}
 	var all []PullRequest
 	seen := make(map[string]bool)
-	for _, org := range orgs {
-		// Search all PRs in the org — not filtered to involves:@me — so the user
-		// gets a full org pulse, not just their own activity.
-		prs, err := c.search(ctx, fmt.Sprintf("type:pr org:%s updated:>%s", org, dateStr))
-		if err != nil {
-			return nil, fmt.Errorf("search org %s: %w", org, err)
-		}
+
+	addPRs := func(prs []PullRequest) {
 		for _, pr := range prs {
 			key := fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
 			if !seen[key] {
@@ -93,6 +90,25 @@ func (c *Client) ListRecentPRs(ctx context.Context, since time.Time, orgs []stri
 			}
 		}
 	}
+
+	for _, org := range orgs {
+		// Search all PRs in the org — not filtered to involves:@me — so the user
+		// gets a full org pulse, not just their own activity.
+		prs, err := c.search(ctx, fmt.Sprintf("type:pr org:%s updated:>%s", org, dateStr))
+		if err != nil {
+			return nil, fmt.Errorf("search org %s: %w", org, err)
+		}
+		addPRs(prs)
+	}
+
+	if username != "" {
+		prs, err := c.search(ctx, fmt.Sprintf("type:pr user:%s updated:>%s", username, dateStr))
+		if err != nil {
+			return nil, fmt.Errorf("search user %s: %w", username, err)
+		}
+		addPRs(prs)
+	}
+
 	return all, nil
 }
 

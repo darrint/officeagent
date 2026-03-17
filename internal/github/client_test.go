@@ -47,7 +47,7 @@ func TestListRecentPRs_noOrgs(t *testing.T) {
 	c := NewClient("test-token")
 	c.SetBaseURL(ts.URL)
 
-	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), nil)
+	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestListRecentPRs_merged(t *testing.T) {
 	c := NewClient("tok")
 	c.SetBaseURL(ts.URL)
 
-	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), nil)
+	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestListRecentPRs_withOrgs(t *testing.T) {
 	c := NewClient("tok")
 	c.SetBaseURL(ts.URL)
 
-	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), []string{"orgA", "orgB"})
+	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), []string{"orgA", "orgB"}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -148,6 +148,54 @@ func TestListRecentPRs_withOrgs(t *testing.T) {
 	}
 	if len(prs) != 2 {
 		t.Errorf("expected 2 PRs (one per org), got %d", len(prs))
+	}
+}
+
+func TestListRecentPRs_withOrgsAndUsername(t *testing.T) {
+	var queries []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query().Get("q"))
+		w.Header().Set("Content-Type", "application/json")
+		n := len(queries)
+		_, _ = fmt.Fprintf(w, `{
+			"items": [
+				{
+					"number": %d,
+					"title": "PR %d",
+					"html_url": "https://github.com/owner%d/repo/pull/%d",
+					"repository_url": "https://api.github.com/repos/owner%d/repo",
+					"state": "open",
+					"updated_at": "2026-03-10T12:00:00Z",
+					"pull_request": {"merged_at": null},
+					"user": {"login": "user"}
+				}
+			]
+		}`, n, n, n, n, n)
+	}))
+	defer ts.Close()
+
+	c := NewClient("tok")
+	c.SetBaseURL(ts.URL)
+
+	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), []string{"myorg"}, "mylogin")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should have made 2 calls: one for org:myorg, one for user:mylogin.
+	if len(queries) != 2 {
+		t.Fatalf("expected 2 API calls, got %d", len(queries))
+	}
+	orgQuery := queries[0]
+	userQuery := queries[1]
+	if !strings.Contains(orgQuery, "org:myorg") {
+		t.Errorf("first query should contain org:myorg, got: %s", orgQuery)
+	}
+	if !strings.Contains(userQuery, "user:mylogin") {
+		t.Errorf("second query should contain user:mylogin, got: %s", userQuery)
+	}
+	// Two calls with distinct PRs → 2 results.
+	if len(prs) != 2 {
+		t.Errorf("expected 2 PRs, got %d", len(prs))
 	}
 }
 
@@ -161,7 +209,7 @@ func TestListRecentPRs_apiError(t *testing.T) {
 	c := NewClient("bad-token")
 	c.SetBaseURL(ts.URL)
 
-	_, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), nil)
+	_, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -1), nil, "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

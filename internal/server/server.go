@@ -46,7 +46,7 @@ type llmService interface {
 
 // githubService is the subset of github.Client used by the server.
 type githubService interface {
-	ListRecentPRs(ctx context.Context, since time.Time, orgs []string) ([]github.PullRequest, error)
+	ListRecentPRs(ctx context.Context, since time.Time, orgs []string, username string) ([]github.PullRequest, error)
 }
 
 // fastmailService is the subset of fastmail.Client used by the server.
@@ -587,6 +587,12 @@ func (s *Server) githubOrgs() []string {
 	return orgs
 }
 
+// githubUsername returns the GitHub username from settings, used to include
+// personal repo PRs alongside org-scoped results.
+func (s *Server) githubUsername() string {
+	return strings.TrimSpace(s.getSetting("github.username", ""))
+}
+
 var settingsTmpl = template.Must(template.New("settings").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -658,6 +664,11 @@ button:hover{background:#006cbd}
       <p class="hint">Comma-separated list of GitHub org names to filter PRs by. Leave blank to search all accessible repos.</p>
     </div>
     <div class="card">
+      <label for="github_username">GitHub username (optional)</label>
+      <input type="text" id="github_username" name="github_username" value="{{.GitHubUsername}}" placeholder="your-github-login">
+      <p class="hint">Your GitHub username. When org filters are set, personal repo PRs are only included if you enter your username here.</p>
+    </div>
+    <div class="card">
       <label for="github_token">GitHub token{{if .GitHubTokenSet}}<span class="token-set">&#10003; Token is set</span>{{end}}</label>
       <input type="password" id="github_token" name="github_token" autocomplete="new-password" placeholder="Leave blank to keep existing token">
       <p class="hint">GitHub OAuth token with <code>copilot</code> scope, used for LLM and GitHub PR features. Run <code>gh auth login --scopes copilot</code> then <code>gh auth token</code> to obtain one. Never echoed back to the browser.</p>
@@ -709,6 +720,7 @@ type settingsData struct {
 	FastmailPrompt         string
 	GitHubLookbackDays     string
 	GitHubOrgs             string
+	GitHubUsername         string
 	GitHubTokenSet         bool   // true if a GitHub token is stored (never echo the value)
 	FastmailTokenSet       bool   // true if a Fastmail token is stored (never echo the value)
 	AzureClientID          string // not a secret — can be shown in the UI
@@ -732,6 +744,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		FastmailPrompt:        s.getPrompt("fastmail", defaultFastmailPrompt),
 		GitHubLookbackDays:    s.getSetting("github.lookback_days", "0"),
 		GitHubOrgs:            s.getSetting("github.orgs", ""),
+		GitHubUsername:        s.getSetting("github.username", ""),
 		GitHubTokenSet:        s.effectiveGitHubToken() != "",
 		FastmailTokenSet:      s.effectiveFastmailToken() != "",
 		AzureClientID:         s.effectiveAzureClientID(),
@@ -763,6 +776,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	fastmailPrompt := strings.TrimSpace(r.FormValue("fastmail_prompt"))
 	githubLookback := strings.TrimSpace(r.FormValue("github_lookback_days"))
 	githubOrgs := strings.TrimSpace(r.FormValue("github_orgs"))
+	githubUsername := strings.TrimSpace(r.FormValue("github_username"))
 	githubToken := strings.TrimSpace(r.FormValue("github_token"))
 	fastmailToken := strings.TrimSpace(r.FormValue("fastmail_token"))
 	azureClientID := strings.TrimSpace(r.FormValue("azure_client_id"))
@@ -792,6 +806,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.store.Set("setting.github.orgs", githubOrgs); err != nil {
 			log.Printf("store set setting.github.orgs: %v", err)
+		}
+		if err := s.store.Set("setting.github.username", githubUsername); err != nil {
+			log.Printf("store set setting.github.username: %v", err)
 		}
 		// Only update the GitHub token if a non-empty value was submitted.
 		// An empty submission means "keep existing token".
@@ -1275,7 +1292,7 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 			ghCh <- ghResult{}
 			return
 		}
-		prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs())
+		prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs(), s.githubUsername())
 		if err != nil {
 			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}}
 			return

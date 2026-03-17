@@ -67,7 +67,7 @@ type fakeGitHub struct {
 	err error
 }
 
-func (f fakeGitHub) ListRecentPRs(_ context.Context, _ time.Time, _ []string) ([]ghpkg.PullRequest, error) {
+func (f fakeGitHub) ListRecentPRs(_ context.Context, _ time.Time, _ []string, _ string) ([]ghpkg.PullRequest, error) {
 	return f.prs, f.err
 }
 
