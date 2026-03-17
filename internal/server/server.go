@@ -1301,16 +1301,62 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		if len(prs) == 0 {
 			sb.WriteString("No recent pull request activity.")
 		} else {
+			cutoff24h := time.Now().UTC().Add(-24 * time.Hour)
+
+			// Partition into newly opened (created in last 24h) vs active (older).
+			var newPRs, activePRs []github.PullRequest
 			for _, pr := range prs {
+				if pr.CreatedAt.After(cutoff24h) {
+					newPRs = append(newPRs, pr)
+				} else {
+					activePRs = append(activePRs, pr)
+				}
+			}
+
+			writePR := func(pr github.PullRequest) {
 				status := pr.State
 				if pr.MergedAt != nil {
 					status = "merged"
 				}
-				fmt.Fprintf(&sb, "- [%s#%d](%s) %s (%s) — updated %s\n",
+				fmt.Fprintf(&sb, "- [%s#%d](%s) %s (%s) by %s — updated %s\n",
 					pr.Repo, pr.Number, pr.HTMLURL, pr.Title,
-					status,
-					pr.UpdatedAt.In(easternLoc).Format("Mon Jan 2"),
+					status, pr.Author,
+					pr.UpdatedAt.In(easternLoc).Format("Mon Jan 2 15:04"),
 				)
+				for _, r := range pr.Reviews {
+					fmt.Fprintf(&sb, "  - review by %s: %s (%s)\n",
+						r.Author, r.State,
+						r.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
+					)
+				}
+				for _, cm := range pr.Comments {
+					fmt.Fprintf(&sb, "  - comment by %s (%s): %s\n",
+						cm.Author,
+						cm.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
+						cm.Body,
+					)
+				}
+				for _, co := range pr.RecentCommits {
+					fmt.Fprintf(&sb, "  - commit %s by %s (%s): %s\n",
+						co.SHA, co.Author,
+						co.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
+						co.Message,
+					)
+				}
+			}
+
+			if len(newPRs) > 0 {
+				sb.WriteString("### New PRs opened today\n")
+				for _, pr := range newPRs {
+					writePR(pr)
+				}
+				sb.WriteString("\n")
+			}
+			if len(activePRs) > 0 {
+				sb.WriteString("### Active PRs with recent updates\n")
+				for _, pr := range activePRs {
+					writePR(pr)
+				}
 			}
 		}
 		reply, err := llmC.Chat(ctx, []llm.Message{

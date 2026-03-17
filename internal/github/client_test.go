@@ -10,11 +10,32 @@ import (
 	"time"
 )
 
-func TestListRecentPRs_noOrgs(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/search/issues" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
+// emptyEnrichHandler returns empty arrays for all enrichment endpoints
+// (/pulls/.../reviews, /pulls/.../comments, /issues/.../comments,
+// /pulls/.../commits) and delegates /search/issues to searchHandler.
+func emptyEnrichHandler(searchHandler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case p == "/search/issues":
+			searchHandler(w, r)
+		case strings.Contains(p, "/reviews"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[]`)
+		case strings.Contains(p, "/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[]`)
+		case strings.Contains(p, "/commits"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
 		}
+	}
+}
+
+func TestListRecentPRs_noOrgs(t *testing.T) {
+	ts := httptest.NewServer(emptyEnrichHandler(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if q == "" {
 			t.Error("expected non-empty q parameter")
@@ -35,6 +56,7 @@ func TestListRecentPRs_noOrgs(t *testing.T) {
 					"html_url": "https://github.com/owner/repo/pull/42",
 					"repository_url": "https://api.github.com/repos/owner/repo",
 					"state": "open",
+					"created_at": "2026-03-09T10:00:00Z",
 					"updated_at": "2026-03-10T12:00:00Z",
 					"pull_request": {"merged_at": null},
 					"user": {"login": "alice"}
@@ -73,7 +95,7 @@ func TestListRecentPRs_noOrgs(t *testing.T) {
 }
 
 func TestListRecentPRs_merged(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(emptyEnrichHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{
 			"items": [
@@ -83,6 +105,7 @@ func TestListRecentPRs_merged(t *testing.T) {
 					"html_url": "https://github.com/org/svc/pull/7",
 					"repository_url": "https://api.github.com/repos/org/svc",
 					"state": "closed",
+					"created_at": "2026-03-10T08:00:00Z",
 					"updated_at": "2026-03-11T09:00:00Z",
 					"pull_request": {"merged_at": "2026-03-11T08:55:00Z"},
 					"user": {"login": "bob"}
@@ -108,17 +131,15 @@ func TestListRecentPRs_merged(t *testing.T) {
 }
 
 func TestListRecentPRs_withOrgs(t *testing.T) {
-	calls := 0
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+	searchCalls := 0
+	ts := httptest.NewServer(emptyEnrichHandler(func(w http.ResponseWriter, r *http.Request) {
+		searchCalls++
 		q := r.URL.Query().Get("q")
-		// When orgs are provided, query must NOT contain involves:@me —
-		// we want all org activity, not just the authenticated user's PRs.
+		// When orgs are provided, query must NOT contain involves:@me.
 		if strings.Contains(q, "involves:") {
 			t.Errorf("org-scoped query should not contain involves:@me, got: %s", q)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		// Return one unique PR per call with different repo names so dedup is exercised.
 		_, _ = fmt.Fprintf(w, `{
 			"items": [
 				{
@@ -127,12 +148,13 @@ func TestListRecentPRs_withOrgs(t *testing.T) {
 					"html_url": "https://github.com/org%d/repo/pull/%d",
 					"repository_url": "https://api.github.com/repos/org%d/repo",
 					"state": "open",
+					"created_at": "2026-03-09T12:00:00Z",
 					"updated_at": "2026-03-10T12:00:00Z",
 					"pull_request": {"merged_at": null},
 					"user": {"login": "user"}
 				}
 			]
-		}`, calls, calls, calls, calls, calls)
+		}`, searchCalls, searchCalls, searchCalls, searchCalls, searchCalls)
 	}))
 	defer ts.Close()
 
@@ -143,8 +165,8 @@ func TestListRecentPRs_withOrgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if calls != 2 {
-		t.Errorf("expected 2 API calls for 2 orgs, got %d", calls)
+	if searchCalls != 2 {
+		t.Errorf("expected 2 search API calls for 2 orgs, got %d", searchCalls)
 	}
 	if len(prs) != 2 {
 		t.Errorf("expected 2 PRs (one per org), got %d", len(prs))
@@ -153,7 +175,7 @@ func TestListRecentPRs_withOrgs(t *testing.T) {
 
 func TestListRecentPRs_withOrgsAndUsername(t *testing.T) {
 	var queries []string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(emptyEnrichHandler(func(w http.ResponseWriter, r *http.Request) {
 		queries = append(queries, r.URL.Query().Get("q"))
 		w.Header().Set("Content-Type", "application/json")
 		n := len(queries)
@@ -165,6 +187,7 @@ func TestListRecentPRs_withOrgsAndUsername(t *testing.T) {
 					"html_url": "https://github.com/owner%d/repo/pull/%d",
 					"repository_url": "https://api.github.com/repos/owner%d/repo",
 					"state": "open",
+					"created_at": "2026-03-09T12:00:00Z",
 					"updated_at": "2026-03-10T12:00:00Z",
 					"pull_request": {"merged_at": null},
 					"user": {"login": "user"}
@@ -181,21 +204,110 @@ func TestListRecentPRs_withOrgsAndUsername(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Should have made 2 calls: one for org:myorg, one for user:mylogin.
 	if len(queries) != 2 {
-		t.Fatalf("expected 2 API calls, got %d", len(queries))
+		t.Fatalf("expected 2 search API calls, got %d", len(queries))
 	}
-	orgQuery := queries[0]
-	userQuery := queries[1]
-	if !strings.Contains(orgQuery, "org:myorg") {
-		t.Errorf("first query should contain org:myorg, got: %s", orgQuery)
+	if !strings.Contains(queries[0], "org:myorg") {
+		t.Errorf("first query should contain org:myorg, got: %s", queries[0])
 	}
-	if !strings.Contains(userQuery, "user:mylogin") {
-		t.Errorf("second query should contain user:mylogin, got: %s", userQuery)
+	if !strings.Contains(queries[1], "user:mylogin") {
+		t.Errorf("second query should contain user:mylogin, got: %s", queries[1])
 	}
-	// Two calls with distinct PRs → 2 results.
 	if len(prs) != 2 {
 		t.Errorf("expected 2 PRs, got %d", len(prs))
+	}
+}
+
+func TestListRecentPRs_enrichment(t *testing.T) {
+	// Test that reviews, comments, and recent commits are fetched and attached.
+	// Use RFC3339 timestamps far in the future relative to cutoff so they pass
+	// the 24h filter inside fetchComments / fetchCommits.
+	recentTime := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		p := r.URL.Path
+		switch {
+		case p == "/search/issues":
+			_, _ = fmt.Fprint(w, `{
+				"items": [
+					{
+						"number": 1,
+						"title": "Test PR",
+						"html_url": "https://github.com/org/repo/pull/1",
+						"repository_url": "https://api.github.com/repos/org/repo",
+						"state": "open",
+						"created_at": "2026-03-09T10:00:00Z",
+						"updated_at": "2026-03-10T10:00:00Z",
+						"pull_request": {"merged_at": null},
+						"user": {"login": "alice"}
+					}
+				]
+			}`)
+		case strings.Contains(p, "/reviews"):
+			_, _ = fmt.Fprintf(w, `[
+				{"state": "APPROVED", "submitted_at": %q, "user": {"login": "bob"}}
+			]`, recentTime)
+		case strings.HasSuffix(p, "/pulls/1/comments"):
+			_, _ = fmt.Fprintf(w, `[
+				{"body": "Looks good!", "created_at": %q, "user": {"login": "carol"}}
+			]`, recentTime)
+		case strings.HasSuffix(p, "/issues/1/comments"):
+			_, _ = fmt.Fprint(w, `[]`)
+		case strings.Contains(p, "/commits"):
+			_, _ = fmt.Fprintf(w, `[
+				{
+					"sha": "abc1234def",
+					"commit": {
+						"message": "Fix bug\n\nMore details",
+						"author": {"name": "alice", "date": %q}
+					}
+				}
+			]`, recentTime)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := NewClient("tok")
+	c.SetBaseURL(ts.URL)
+
+	prs, err := c.ListRecentPRs(context.Background(), time.Now().AddDate(0, 0, -30), nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(prs) != 1 {
+		t.Fatalf("expected 1 PR, got %d", len(prs))
+	}
+	pr := prs[0]
+
+	if len(pr.Reviews) != 1 {
+		t.Errorf("expected 1 review, got %d", len(pr.Reviews))
+	} else {
+		if pr.Reviews[0].Author != "bob" {
+			t.Errorf("review author: got %q, want %q", pr.Reviews[0].Author, "bob")
+		}
+		if pr.Reviews[0].State != "APPROVED" {
+			t.Errorf("review state: got %q, want %q", pr.Reviews[0].State, "APPROVED")
+		}
+	}
+
+	if len(pr.Comments) != 1 {
+		t.Errorf("expected 1 comment, got %d", len(pr.Comments))
+	} else if pr.Comments[0].Author != "carol" {
+		t.Errorf("comment author: got %q, want %q", pr.Comments[0].Author, "carol")
+	}
+
+	if len(pr.RecentCommits) != 1 {
+		t.Errorf("expected 1 recent commit, got %d", len(pr.RecentCommits))
+	} else {
+		if pr.RecentCommits[0].SHA != "abc1234" {
+			t.Errorf("commit SHA: got %q, want %q", pr.RecentCommits[0].SHA, "abc1234")
+		}
+		if pr.RecentCommits[0].Message != "Fix bug" {
+			t.Errorf("commit message: got %q, want %q", pr.RecentCommits[0].Message, "Fix bug")
+		}
 	}
 }
 
