@@ -13,11 +13,14 @@ import (
 // emptyEnrichHandler returns empty arrays for all enrichment endpoints
 // (/pulls/.../reviews, /pulls/.../comments, /issues/.../comments,
 // /pulls/.../commits) and delegates /search/issues to searchHandler.
+// It sets X-RateLimit-Remaining to 5000 so enrichment is not skipped.
 func emptyEnrichHandler(searchHandler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		switch {
 		case p == "/search/issues":
+			w.Header().Set("X-RateLimit-Remaining", "5000")
+			w.Header().Set("X-RateLimit-Reset", "9999999999")
 			searchHandler(w, r)
 		case strings.Contains(p, "/reviews"):
 			w.Header().Set("Content-Type", "application/json")
@@ -229,7 +232,10 @@ func TestListRecentPRs_enrichment(t *testing.T) {
 		p := r.URL.Path
 		switch {
 		case p == "/search/issues":
-			_, _ = fmt.Fprint(w, `{
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-RateLimit-Remaining", "5000")
+			w.Header().Set("X-RateLimit-Reset", "9999999999")
+			_, _ = fmt.Fprintf(w, `{
 				"items": [
 					{
 						"number": 1,
@@ -237,13 +243,13 @@ func TestListRecentPRs_enrichment(t *testing.T) {
 						"html_url": "https://github.com/org/repo/pull/1",
 						"repository_url": "https://api.github.com/repos/org/repo",
 						"state": "open",
-						"created_at": "2026-03-09T10:00:00Z",
-						"updated_at": "2026-03-10T10:00:00Z",
+						"created_at": %q,
+						"updated_at": %q,
 						"pull_request": {"merged_at": null},
 						"user": {"login": "alice"}
 					}
 				]
-			}`)
+			}`, recentTime, recentTime)
 		case strings.Contains(p, "/reviews"):
 			_, _ = fmt.Fprintf(w, `[
 				{"state": "APPROVED", "submitted_at": %q, "user": {"login": "bob"}}

@@ -4,14 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const apiBase = "https://api.github.com"
+
+// defaultMaxEnrichPRs is the default cap on how many PRs receive per-PR API
+// enrichment (reviews, comments, commits). Kept low to limit API usage.
+const defaultMaxEnrichPRs = 20
+
+// rateLimitMinRemaining is the threshold at which we stop enriching and log a
+// warning rather than risk hitting the secondary rate limit.
+const rateLimitMinRemaining = 10
 
 // Review represents a pull request review (approval, rejection, or comment).
 type Review struct {
@@ -55,22 +65,28 @@ type PullRequest struct {
 
 // Client makes authenticated requests to the GitHub REST API.
 type Client struct {
-	token   string
-	http    *http.Client
-	baseURL string // defaults to apiBase; overridable in tests
+	token         string
+	http          *http.Client
+	baseURL       string // defaults to apiBase; overridable in tests
+	maxEnrichPRs  int    // max PRs to enrich with reviews/comments/commits
 }
 
 // NewClient creates a GitHub API client using the given OAuth or personal access token.
 func NewClient(token string) *Client {
 	return &Client{
-		token:   token,
-		http:    &http.Client{Timeout: 30 * time.Second},
-		baseURL: apiBase,
+		token:        token,
+		http:         &http.Client{Timeout: 30 * time.Second},
+		baseURL:      apiBase,
+		maxEnrichPRs: defaultMaxEnrichPRs,
 	}
 }
 
 // SetBaseURL overrides the API base URL. Intended for testing only.
 func (c *Client) SetBaseURL(u string) { c.baseURL = u }
+
+// SetMaxEnrichPRs sets the maximum number of PRs that will receive per-PR
+// enrichment API calls (reviews, comments, commits). Defaults to 20.
+func (c *Client) SetMaxEnrichPRs(n int) { c.maxEnrichPRs = n }
 
 // searchItem is the raw JSON shape returned by GitHub's search API for a PR item.
 type searchItem struct {
@@ -141,45 +157,69 @@ func (c *Client) ListRecentPRs(ctx context.Context, since time.Time, orgs []stri
 }
 
 // searchAndEnrich runs a search query and then concurrently fetches reviews,
-// comments, and recent commits for each PR.
+// comments, and recent commits for each PR updated within the last 24 hours,
+// capped at c.maxEnrichPRs. Rate-limit headers are checked before enrichment
+// and if remaining requests are critically low, enrichment is skipped.
 func (c *Client) searchAndEnrich(ctx context.Context, since time.Time, query string) ([]PullRequest, error) {
-	prs, err := c.search(ctx, query)
+	prs, rateRemaining, rateReset, err := c.searchWithRateInfo(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 
-	// Enrich up to 20 PRs concurrently to avoid hammering the API.
+	cutoff24h := time.Now().UTC().Add(-24 * time.Hour)
+
+	// Only enrich PRs updated within the last 24h — older PRs are shown in the
+	// briefing but we skip the extra API calls for them.
+	var toEnrich []int
+	for i, pr := range prs {
+		if pr.UpdatedAt.After(cutoff24h) {
+			toEnrich = append(toEnrich, i)
+		}
+		if len(toEnrich) >= c.maxEnrichPRs {
+			break
+		}
+	}
+
+	// Check rate limit headroom. Skip enrichment entirely if too low.
+	if rateRemaining <= rateLimitMinRemaining {
+		log.Printf("github: rate limit low (%d remaining, resets %s) — skipping PR enrichment",
+			rateRemaining, rateReset.Format(time.RFC3339))
+		_ = since
+		return prs, nil
+	}
+
 	const maxConcurrent = 5
 	sem := make(chan struct{}, maxConcurrent)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	for i := range prs {
+	for _, idx := range toEnrich {
 		wg.Add(1)
-		go func(idx int) {
+		go func(i int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			pr := &prs[idx]
+			pr := &prs[i]
 			reviews, _ := c.fetchReviews(ctx, pr.Repo, pr.Number)
-			comments, _ := c.fetchComments(ctx, pr.Repo, pr.Number, cutoff)
-			commits, _ := c.fetchCommits(ctx, pr.Repo, pr.Number, cutoff)
+			comments, _ := c.fetchComments(ctx, pr.Repo, pr.Number, cutoff24h)
+			commits, _ := c.fetchCommits(ctx, pr.Repo, pr.Number, cutoff24h)
 
 			mu.Lock()
 			pr.Reviews = reviews
 			pr.Comments = comments
 			pr.RecentCommits = commits
 			mu.Unlock()
-		}(i)
+		}(idx)
 	}
 	wg.Wait()
-	_ = since // kept for call-site clarity
+	_ = since
 	return prs, nil
 }
 
-func (c *Client) search(ctx context.Context, query string) ([]PullRequest, error) {
+// searchWithRateInfo runs a search query and returns PRs along with the
+// X-RateLimit-Remaining count and X-RateLimit-Reset time from the response.
+func (c *Client) searchWithRateInfo(ctx context.Context, query string) ([]PullRequest, int, time.Time, error) {
 	params := url.Values{
 		"per_page": {"50"},
 		"sort":     {"updated"},
@@ -189,29 +229,34 @@ func (c *Client) search(ctx context.Context, query string) ([]PullRequest, error
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.baseURL+"/search/issues?"+params.Encode(), nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, time.Time{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	c.setHeaders(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("github search: %w", err)
+		return nil, 0, time.Time{}, fmt.Errorf("github search: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// Parse rate-limit headers — best effort, zero values are safe defaults.
+	remaining, _ := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining"))
+	var resetAt time.Time
+	if resetUnix, err2 := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err2 == nil {
+		resetAt = time.Unix(resetUnix, 0)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody struct {
 			Message string `json:"message"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&errBody)
-		return nil, fmt.Errorf("github %s: %s", resp.Status, errBody.Message)
+		return nil, remaining, resetAt, fmt.Errorf("github %s: %s", resp.Status, errBody.Message)
 	}
 
 	var sr searchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return nil, fmt.Errorf("decode search response: %w", err)
+		return nil, remaining, resetAt, fmt.Errorf("decode search response: %w", err)
 	}
 
 	prs := make([]PullRequest, len(sr.Items))
@@ -228,7 +273,7 @@ func (c *Client) search(ctx context.Context, query string) ([]PullRequest, error
 			Author:    item.User.Login,
 		}
 	}
-	return prs, nil
+	return prs, remaining, resetAt, nil
 }
 
 // fetchReviews fetches all reviews for a PR.
