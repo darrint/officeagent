@@ -181,6 +181,17 @@ func (s *Server) effectiveAzureClientID() string {
 	return s.cfg.AzureClientID
 }
 
+// effectiveAzureTenantID returns the Azure tenant ID from the store if set,
+// otherwise falls back to the value loaded from the env var at startup.
+func (s *Server) effectiveAzureTenantID() string {
+	if s.store != nil {
+		if v, err := s.store.Get("setting.azure_tenant_id"); err == nil && v != "" {
+			return v
+		}
+	}
+	return s.cfg.AzureTenantID
+}
+
 // effectiveFastmailToken returns the Fastmail API token from the store.
 func (s *Server) effectiveFastmailToken() string {
 	if s.store != nil {
@@ -662,6 +673,11 @@ button:hover{background:#006cbd}
       <p class="hint">Azure AD app client ID used for Microsoft Graph OAuth. Register the app in Azure Portal under "Mobile and desktop applications" with redirect URI <code>http://localhost:8080/login/callback</code>.</p>
     </div>
     <div class="card">
+      <label for="azure_tenant_id">Azure tenant ID</label>
+      <input type="text" id="azure_tenant_id" name="azure_tenant_id" value="{{.AzureTenantID}}" placeholder="common">
+      <p class="hint">Azure AD tenant ID. Use <code>common</code> for personal Microsoft accounts / multi-tenant, or paste your organisation's tenant GUID or domain (e.g. <code>contoso.onmicrosoft.com</code>).</p>
+    </div>
+    <div class="card">
       <label for="fastmail_lowprio_folder">Fastmail low-priority folder name</label>
       <input type="text" id="fastmail_lowprio_folder" name="fastmail_lowprio_folder" value="{{.FastmailLowPrioFolder}}" placeholder="Low Priority">
       <p class="hint">Fastmail mailbox to move low-priority mail into when "Move Low-Priority Mail" is used.</p>
@@ -696,6 +712,7 @@ type settingsData struct {
 	GitHubTokenSet         bool   // true if a GitHub token is stored (never echo the value)
 	FastmailTokenSet       bool   // true if a Fastmail token is stored (never echo the value)
 	AzureClientID          string // not a secret — can be shown in the UI
+	AzureTenantID          string // not a secret — can be shown in the UI
 	FastmailLowPrioFolder  string
 	GraphLowPrioFolder     string
 	NtfyTopic              string // stored as setting.ntfy_topic; shown as password input
@@ -718,6 +735,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		GitHubTokenSet:        s.effectiveGitHubToken() != "",
 		FastmailTokenSet:      s.effectiveFastmailToken() != "",
 		AzureClientID:         s.effectiveAzureClientID(),
+		AzureTenantID:         s.effectiveAzureTenantID(),
 		FastmailLowPrioFolder: s.getSetting("fastmail_lowprio_folder", "Low Priority"),
 		GraphLowPrioFolder:    s.getSetting("graph_lowprio_folder", "Low Priority"),
 		NtfyTopic:             s.getSetting("ntfy_topic", ""),
@@ -748,6 +766,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	githubToken := strings.TrimSpace(r.FormValue("github_token"))
 	fastmailToken := strings.TrimSpace(r.FormValue("fastmail_token"))
 	azureClientID := strings.TrimSpace(r.FormValue("azure_client_id"))
+	azureTenantID := strings.TrimSpace(r.FormValue("azure_tenant_id"))
 	fastmailLowPrioFolder := strings.TrimSpace(r.FormValue("fastmail_lowprio_folder"))
 	graphLowPrioFolder := strings.TrimSpace(r.FormValue("graph_lowprio_folder"))
 	ntfyTopic := strings.TrimSpace(r.FormValue("ntfy_topic"))
@@ -793,6 +812,11 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		if azureClientID != "" {
 			if err := s.store.Set("setting.azure_client_id", azureClientID); err != nil {
 				log.Printf("store set setting.azure_client_id: %v", err)
+			}
+		}
+		if azureTenantID != "" {
+			if err := s.store.Set("setting.azure_tenant_id", azureTenantID); err != nil {
+				log.Printf("store set setting.azure_tenant_id: %v", err)
 			}
 		}
 		if fastmailLowPrioFolder != "" {

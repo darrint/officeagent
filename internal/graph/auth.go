@@ -53,16 +53,29 @@ func (a *Auth) effectiveClientID() string {
 	return a.cfg.ClientID
 }
 
-// oauthConfig builds an oauth2.Config using the current effective client ID.
-// Called on every OAuth operation so that a Settings-page update takes effect
-// without restarting the server.
+// effectiveTenantID returns the Azure AD tenant ID to use. It prefers the
+// value stored in "setting.azure_tenant_id" (set via the Settings page) and
+// falls back to the value supplied at construction time (env var / default).
+func (a *Auth) effectiveTenantID() string {
+	if a.store != nil {
+		if v, err := a.store.Get("setting.azure_tenant_id"); err == nil && v != "" {
+			return v
+		}
+	}
+	return a.cfg.TenantID
+}
+
+// oauthConfig builds an oauth2.Config using the current effective client ID
+// and tenant ID. Called on every OAuth operation so that Settings-page updates
+// take effect without restarting the server.
 func (a *Auth) oauthConfig() *oauth2.Config {
+	tenantID := a.effectiveTenantID()
 	return &oauth2.Config{
 		ClientID: a.effectiveClientID(),
 		Scopes:   graphScopes,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:   fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", a.cfg.TenantID),
-			TokenURL:  fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.cfg.TenantID),
+			AuthURL:   fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", tenantID),
+			TokenURL:  fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenantID),
 			AuthStyle: oauth2.AuthStyleInParams,
 		},
 	}
