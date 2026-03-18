@@ -2300,7 +2300,7 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("authenticated, token expires %s", tok.Expiry)
 
-	http.Redirect(w, r, "/login", http.StatusFound)
+	http.Redirect(w, r, "/connect", http.StatusFound)
 }
 
 func (s *Server) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
