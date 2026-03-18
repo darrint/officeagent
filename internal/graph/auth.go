@@ -99,6 +99,10 @@ func (a *Auth) AuthCodeURL(redirectURI string) (authURL, state, verifier string,
 		state,
 		oauth2.S256ChallengeOption(verifier),
 		oauth2.SetAuthURLParam("redirect_uri", redirectURI),
+		// Force Azure to re-present the consent screen so that newly-added
+		// scopes (e.g. Mail.ReadWrite) are granted even when the user has
+		// previously consented to an older, smaller scope set.
+		oauth2.SetAuthURLParam("prompt", "consent"),
 	)
 	return authURL, state, verifier, nil
 }
