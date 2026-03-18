@@ -744,12 +744,12 @@ func (f *fakeGraphMover) GetOrCreateFolder(_ context.Context, name string) (stri
 	return "folder-id", nil
 }
 
-func (f *fakeGraphMover) MoveMessages(_ context.Context, ids []string, _ string) error {
+func (f *fakeGraphMover) MoveMessages(_ context.Context, ids []string, _ string) (int, error) {
 	if f.moveErr != nil {
-		return f.moveErr
+		return 0, f.moveErr
 	}
 	f.movedIDs = append(f.movedIDs, ids...)
-	return nil
+	return len(ids), nil
 }
 
 // TestGenerateBriefing_cachesLowPrioIDs verifies that GenerateBriefing stores

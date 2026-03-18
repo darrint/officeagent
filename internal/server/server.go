@@ -74,7 +74,7 @@ type fastmailReadOnlyChecker interface {
 type graphMoverService interface {
 	graphService
 	GetOrCreateFolder(ctx context.Context, name string) (string, error)
-	MoveMessages(ctx context.Context, messageIDs []string, folderID string) error
+	MoveMessages(ctx context.Context, messageIDs []string, folderID string) (int, error)
 }
 
 // classifyMsg is a compact message descriptor sent to the LLM for classification.
@@ -1256,10 +1256,11 @@ func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (int,
 	if err != nil {
 		return 0, fmt.Sprintf("get/create folder: %v", err)
 	}
-	if err := gC.MoveMessages(ctx, ids, folderID); err != nil {
-		return 0, fmt.Sprintf("move messages: %v", err)
+	moved, err := gC.MoveMessages(ctx, ids, folderID)
+	if err != nil {
+		return moved, fmt.Sprintf("move messages: %v", err)
 	}
-	return len(ids), ""
+	return moved, ""
 }
 
 // handleArchiveLowPrio handles POST /archive-lowprio — classifies inbox messages

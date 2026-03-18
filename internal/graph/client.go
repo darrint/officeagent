@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -379,13 +380,16 @@ func (c *Client) GetOrCreateFolder(ctx context.Context, name string) (string, er
 
 // MoveMessages moves the given message IDs to the target folder concurrently.
 // Each message requires a separate POST to /me/messages/{id}/move per Graph API.
-func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID string) error {
+// Messages that are no longer found (404) are silently skipped — they may have
+// been deleted or already moved. Returns the number of messages actually moved.
+func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID string) (int, error) {
 	if len(messageIDs) == 0 {
-		return nil
+		return 0, nil
 	}
 	type result struct {
-		id  string
-		err error
+		id      string
+		err     error
+		notFound bool
 	}
 	results := make(chan result, len(messageIDs))
 	var wg sync.WaitGroup
@@ -395,20 +399,38 @@ func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID
 			defer wg.Done()
 			path := "/me/messages/" + url.PathEscape(msgID) + "/move"
 			err := c.post(ctx, path, map[string]string{"destinationId": folderID}, nil)
-			results <- result{id: msgID, err: err}
+			notFound := err != nil && isGraphNotFound(err)
+			results <- result{id: msgID, err: err, notFound: notFound}
 		}(id)
 	}
 	wg.Wait()
 	close(results)
 
+	moved := 0
 	var errs []string
 	for r := range results {
-		if r.err != nil {
+		switch {
+		case r.err == nil:
+			moved++
+		case r.notFound:
+			log.Printf("MoveMessages: skipping %s (not found)", r.id)
+		default:
 			errs = append(errs, fmt.Sprintf("%s: %v", r.id, r.err))
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("move errors: %s", errs[0])
+		return moved, fmt.Errorf("move errors: %s", errs[0])
 	}
-	return nil
+	return moved, nil
+}
+
+// isGraphNotFound returns true if the error from a Graph API call indicates
+// the resource was not found (HTTP 404 / ItemNotFound) or is gone (HTTP 410).
+func isGraphNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "404") || strings.Contains(s, "ItemNotFound") ||
+		strings.Contains(s, "ErrorItemNotFound") || strings.Contains(s, "410")
 }
