@@ -444,6 +444,9 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 .lowprio-list .lp-from{font-weight:600;color:#444;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;flex-shrink:0}
 .lowprio-list .lp-subj{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lowprio-list .lp-date{white-space:nowrap;color:#aaa;font-size:.78rem;flex-shrink:0}
+.lowprio-list .lp-src{font-size:.72rem;font-weight:700;border-radius:3px;padding:.1rem .35rem;flex-shrink:0;white-space:nowrap}
+.lowprio-list .lp-src-graph{background:#dce8f5;color:#0550ae}
+.lowprio-list .lp-src-fastmail{background:#e8f5e9;color:#1a7f37}
 .lowprio-panel{padding:.75rem 1rem;background:#fafafa;border:1px solid #ececec;border-radius:8px;margin-top:.5rem}
 .lowprio-actions{display:flex;align-items:center;gap:1rem;margin-top:.75rem}
 .lowprio-actions button{background:#555;color:#fff;border:none;border-radius:6px;padding:.35rem .9rem;font-size:.82rem;font-weight:600;cursor:pointer}
@@ -581,6 +584,7 @@ function sendReport() {
       <ul class="lowprio-list">
         {{range .LowPrioMsgs}}
         <li>
+          {{if eq .Source "graph"}}<span class="lp-src lp-src-graph">Work</span>{{else if eq .Source "fastmail"}}<span class="lp-src lp-src-fastmail">Personal</span>{{end}}
           <span class="lp-from">{{.From}}</span>
           <span class="lp-subj">{{.Subject}}</span>
           <span class="lp-date">{{.ReceivedAt.Format "Jan 2 3:04 PM"}}</span>
