@@ -141,9 +141,12 @@ type progressEvent struct {
 }
 
 // progressBus fans out progress events to all connected SSE clients.
+// It also remembers the last terminal event ("done" or "error") so that
+// clients which connect after generation finishes receive it immediately.
 type progressBus struct {
-	mu      sync.Mutex
-	clients map[chan progressEvent]struct{}
+	mu       sync.Mutex
+	clients  map[chan progressEvent]struct{}
+	lastDone *progressEvent // non-nil once a terminal event has been published
 }
 
 func newProgressBus() *progressBus {
@@ -151,10 +154,15 @@ func newProgressBus() *progressBus {
 }
 
 // subscribe registers a new SSE client and returns its channel.
+// If a terminal event was already published, it is pre-queued so the client
+// receives it without waiting.
 func (b *progressBus) subscribe() chan progressEvent {
 	ch := make(chan progressEvent, 16)
 	b.mu.Lock()
 	b.clients[ch] = struct{}{}
+	if b.lastDone != nil {
+		ch <- *b.lastDone
+	}
 	b.mu.Unlock()
 	return ch
 }
@@ -167,15 +175,27 @@ func (b *progressBus) unsubscribe(ch chan progressEvent) {
 }
 
 // publish sends an event to all current subscribers (non-blocking per client).
+// Terminal events ("done" or "error") are also cached so late subscribers get them.
 func (b *progressBus) publish(ev progressEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if ev.Step == "done" || ev.Step == "error" {
+		b.lastDone = &ev
+	}
 	for ch := range b.clients {
 		select {
 		case ch <- ev:
 		default: // drop if client is too slow
 		}
 	}
+}
+
+// reset clears the cached terminal event. Called when a new generation starts
+// so stale "done" events are not sent to clients connecting mid-generation.
+func (b *progressBus) reset() {
+	b.mu.Lock()
+	b.lastDone = nil
+	b.mu.Unlock()
 }
 
 // Server is the officeagent HTTP server.
@@ -1397,6 +1417,10 @@ func (s *Server) saveLastReport(rep *cachedReport) error {
 // It is safe to call from background goroutines (uses the supplied context).
 // Progress events are published to s.progress throughout execution.
 func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
+	// Clear any cached terminal event from the previous run so clients that
+	// connect during this generation don't immediately receive a stale "done".
+	s.progress.reset()
+
 	emit := func(step, msg string) {
 		s.progress.publish(progressEvent{Step: step, Message: msg})
 	}
