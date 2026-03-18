@@ -32,6 +32,8 @@ type authService interface {
 	IsAuthenticated(ctx context.Context) bool
 	AuthCodeURL(redirectURI string) (authURL, state, verifier string, err error)
 	ExchangeCode(ctx context.Context, code, verifier, redirectURI string) (*oauth2.Token, error)
+	TokenExpiry(ctx context.Context) (time.Time, bool)
+	ClearToken() error
 }
 
 // graphService is the subset of graph.Client used by the server.
@@ -332,6 +334,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /generate/progress", s.handleGenerateProgress)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /connect", s.handleConnect)
+	s.mux.HandleFunc("POST /disconnect", s.handleDisconnect)
 	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /login/callback", s.handleLoginCallback)
@@ -2061,6 +2064,10 @@ header a:hover{color:#0078d4}
 .action a{display:inline-block;padding:.45rem 1rem;border-radius:6px;font-size:.85rem;font-weight:600;text-decoration:none;background:#0078d4;color:#fff;white-space:nowrap}
 .action a:hover{background:#006cbd}
 .action-none{font-size:.82rem;color:#aaa}
+.btn-disconnect{background:#c00;color:#fff;border:none;border-radius:6px;padding:.45rem 1rem;font-size:.85rem;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn-disconnect:hover{background:#a00}
+.expiry{display:block;font-size:.78rem;color:#666;margin-top:.25rem}
+.expiry-warn{color:#b86800;font-weight:600}
 .divider{margin:1.5rem 0 .75rem;font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#aaa}
 footer{margin-top:1.5rem;font-size:.78rem;color:#aaa;text-align:right}
 footer a{color:#aaa;text-decoration:none}
@@ -2083,6 +2090,7 @@ footer a:hover{color:#0078d4}
       <div class="service-desc">Email and calendar access via OAuth</div>
       {{if .MSGraphAuth}}
       <span class="badge badge-ok">&#10003; Authenticated</span>
+      {{if .MSGraphExpiry}}<span class="expiry{{if .MSGraphExpired}} expiry-warn{{end}}">Token expires {{.MSGraphExpiry}}</span>{{end}}
       {{else if not .MSGraphClientID}}
       <span class="badge badge-fail">&#10007; Azure client ID not set</span>
       {{else}}
@@ -2091,7 +2099,10 @@ footer a:hover{color:#0078d4}
     </div>
     <div class="action">
       {{if .MSGraphAuth}}
-      <span class="action-none">Connected</span>
+      <a href="/login">Re-authenticate</a>
+      <form method="POST" action="/disconnect" style="display:inline;margin-left:.5rem">
+        <button type="submit" class="btn-disconnect">Disconnect</button>
+      </form>
       {{else if not .MSGraphClientID}}
       <a href="/settings">Configure in Settings</a>
       {{else}}
@@ -2140,16 +2151,26 @@ footer a:hover{color:#0078d4}
 </html>`))
 
 type connectData struct {
-	MSGraphAuth     bool // authenticated with Microsoft Graph
-	MSGraphClientID bool // Azure client ID is configured
-	GitHubToken     bool // GitHub token is configured
-	FastmailToken   bool // Fastmail API token is configured
+	MSGraphAuth      bool      // authenticated with Microsoft Graph
+	MSGraphClientID  bool      // Azure client ID is configured
+	MSGraphExpiry    string    // formatted token expiry (empty if not authenticated)
+	MSGraphExpired   bool      // true if the token is past its expiry time
+	GitHubToken      bool      // GitHub token is configured
+	FastmailToken    bool      // Fastmail API token is configured
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
+	expStr := ""
+	expired := false
+	if exp, ok := s.auth.TokenExpiry(r.Context()); ok {
+		expStr = exp.In(easternLoc).Format("Jan 2 2006 3:04 PM MST")
+		expired = time.Now().After(exp)
+	}
 	data := connectData{
 		MSGraphAuth:     s.auth.IsAuthenticated(r.Context()),
 		MSGraphClientID: s.effectiveAzureClientID() != "",
+		MSGraphExpiry:   expStr,
+		MSGraphExpired:  expired,
 		GitHubToken:     s.effectiveGitHubToken() != "",
 		FastmailToken:   s.effectiveFastmailToken() != "",
 	}
@@ -2157,6 +2178,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err := connectTmpl.Execute(w, data); err != nil {
 		log.Printf("connect template: %v", err)
 	}
+}
+
+// handleDisconnect handles POST /disconnect — clears the stored Graph OAuth
+// token and redirects to /connect so the user can re-authenticate.
+func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	if err := s.auth.ClearToken(); err != nil {
+		http.Error(w, fmt.Sprintf("clear token: %v", err), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/connect", http.StatusSeeOther)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

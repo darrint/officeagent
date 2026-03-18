@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"golang.org/x/oauth2"
 
@@ -32,6 +33,7 @@ type Auth struct {
 // graphScopes are the Microsoft Graph permissions we request.
 var graphScopes = []string{
 	"Mail.Read",
+	"Mail.ReadWrite",
 	"Calendars.Read",
 	"offline_access",
 }
@@ -143,6 +145,23 @@ func (a *Auth) Token(ctx context.Context) (*oauth2.Token, error) {
 func (a *Auth) IsAuthenticated(ctx context.Context) bool {
 	_, err := a.Token(ctx)
 	return err == nil
+}
+
+// TokenExpiry returns the expiry time of the stored (possibly refreshed) token
+// and true. Returns the zero time and false when no token is stored or the
+// token cannot be refreshed.
+func (a *Auth) TokenExpiry(ctx context.Context) (time.Time, bool) {
+	tok, err := a.Token(ctx)
+	if err != nil || tok == nil {
+		return time.Time{}, false
+	}
+	return tok.Expiry, true
+}
+
+// ClearToken deletes the stored OAuth token, effectively signing the user out.
+// After calling this the user must complete the OAuth flow again to reconnect.
+func (a *Auth) ClearToken() error {
+	return a.store.Set(tokenStoreKey, "")
 }
 
 func (a *Auth) saveToken(tok *oauth2.Token) error {

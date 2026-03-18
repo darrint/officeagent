@@ -26,14 +26,27 @@ import (
 // fakeAuth implements authService. Authenticated controls IsAuthenticated.
 type fakeAuth struct {
 	authenticated bool
+	expiry        time.Time // zero means no expiry info
+	clearErr      error
+	clearCalled   bool
 }
 
-func (f fakeAuth) IsAuthenticated(_ context.Context) bool { return f.authenticated }
-func (f fakeAuth) AuthCodeURL(_ string) (string, string, string, error) {
+func (f *fakeAuth) IsAuthenticated(_ context.Context) bool { return f.authenticated }
+func (f *fakeAuth) AuthCodeURL(_ string) (string, string, string, error) {
 	return "https://login.example.com/auth", "state", "verifier", nil
 }
-func (f fakeAuth) ExchangeCode(_ context.Context, _, _, _ string) (*oauth2.Token, error) {
+func (f *fakeAuth) ExchangeCode(_ context.Context, _, _, _ string) (*oauth2.Token, error) {
 	return &oauth2.Token{AccessToken: "tok"}, nil
+}
+func (f *fakeAuth) TokenExpiry(_ context.Context) (time.Time, bool) {
+	if f.expiry.IsZero() {
+		return time.Time{}, false
+	}
+	return f.expiry, true
+}
+func (f *fakeAuth) ClearToken() error {
+	f.clearCalled = true
+	return f.clearErr
 }
 
 // fakeGraph implements graphService.
@@ -215,7 +228,7 @@ func TestFeedbackContext_sectionIsolated(t *testing.T) {
 // --- handleHealth ---
 
 func TestHandleHealth(t *testing.T) {
-	srv := newTestServer(t, fakeAuth{authenticated: true}, nil)
+	srv := newTestServer(t, &fakeAuth{authenticated: true}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 	srv.mux.ServeHTTP(w, req)
@@ -231,7 +244,7 @@ func TestHandleHealth(t *testing.T) {
 // --- handleFeedback validation ---
 
 func TestHandleFeedback_invalidSection(t *testing.T) {
-	srv := newTestServer(t, fakeAuth{authenticated: true}, newMemStore(t))
+	srv := newTestServer(t, &fakeAuth{authenticated: true}, newMemStore(t))
 	form := url.Values{"section": {"invalid"}, "rating": {"good"}, "note": {""}}
 	req := httptest.NewRequest(http.MethodPost, "/feedback", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -243,7 +256,7 @@ func TestHandleFeedback_invalidSection(t *testing.T) {
 }
 
 func TestHandleFeedback_invalidRating(t *testing.T) {
-	srv := newTestServer(t, fakeAuth{authenticated: true}, newMemStore(t))
+	srv := newTestServer(t, &fakeAuth{authenticated: true}, newMemStore(t))
 	form := url.Values{"section": {"email"}, "rating": {"meh"}, "note": {""}}
 	req := httptest.NewRequest(http.MethodPost, "/feedback", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -255,7 +268,7 @@ func TestHandleFeedback_invalidRating(t *testing.T) {
 }
 
 func TestHandleFeedback_unauthenticated(t *testing.T) {
-	srv := newTestServer(t, fakeAuth{authenticated: false}, newMemStore(t))
+	srv := newTestServer(t, &fakeAuth{authenticated: false}, newMemStore(t))
 	form := url.Values{"section": {"email"}, "rating": {"good"}, "note": {""}}
 	req := httptest.NewRequest(http.MethodPost, "/feedback", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -268,7 +281,7 @@ func TestHandleFeedback_unauthenticated(t *testing.T) {
 
 func TestHandleFeedback_valid(t *testing.T) {
 	st := newMemStore(t)
-	srv := newTestServer(t, fakeAuth{authenticated: true}, st)
+	srv := newTestServer(t, &fakeAuth{authenticated: true}, st)
 	form := url.Values{"section": {"email"}, "rating": {"good"}, "note": {"nice summary"}}
 	req := httptest.NewRequest(http.MethodPost, "/feedback", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -294,7 +307,7 @@ func TestHandleFeedback_valid(t *testing.T) {
 // --- handleLoginStatus ---
 
 func TestHandleLoginStatus_authenticated(t *testing.T) {
-	srv := newTestServer(t, fakeAuth{authenticated: true}, nil)
+	srv := newTestServer(t, &fakeAuth{authenticated: true}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/login/status", nil)
 	w := httptest.NewRecorder()
 	srv.mux.ServeHTTP(w, req)
@@ -307,7 +320,7 @@ func TestHandleLoginStatus_authenticated(t *testing.T) {
 }
 
 func TestHandleLoginStatus_unauthenticated(t *testing.T) {
-	srv := newTestServer(t, fakeAuth{authenticated: false}, nil)
+	srv := newTestServer(t, &fakeAuth{authenticated: false}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/login/status", nil)
 	w := httptest.NewRecorder()
 	srv.mux.ServeHTTP(w, req)
@@ -343,7 +356,7 @@ func TestHandleDoctor_allOK(t *testing.T) {
 		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
 	}
 	lc := fakeLLM{reply: "pong"}
-	srv := newDoctorServer(t, fakeAuth{authenticated: true}, gc, lc, st)
+	srv := newDoctorServer(t, &fakeAuth{authenticated: true}, gc, lc, st)
 
 	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
 	w := httptest.NewRecorder()
@@ -369,7 +382,7 @@ func TestHandleDoctor_graphFail(t *testing.T) {
 		evtsErr: fmt.Errorf("token expired"),
 	}
 	lc := fakeLLM{reply: "pong"}
-	srv := newDoctorServer(t, fakeAuth{authenticated: true}, gc, lc, st)
+	srv := newDoctorServer(t, &fakeAuth{authenticated: true}, gc, lc, st)
 
 	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
 	w := httptest.NewRecorder()
@@ -390,7 +403,7 @@ func TestHandleDoctor_graphFail(t *testing.T) {
 
 func TestHandleDoctor_notAuthenticated(t *testing.T) {
 	st := newMemStore(t)
-	srv := newDoctorServer(t, fakeAuth{authenticated: false}, fakeGraph{}, fakeLLM{reply: "pong"}, st)
+	srv := newDoctorServer(t, &fakeAuth{authenticated: false}, fakeGraph{}, fakeLLM{reply: "pong"}, st)
 
 	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
 	w := httptest.NewRecorder()
@@ -407,7 +420,7 @@ func TestHandleDoctor_notAuthenticated(t *testing.T) {
 
 func TestHandleDoctor_llmNotConfigured(t *testing.T) {
 	st := newMemStore(t)
-	srv := newDoctorServer(t, fakeAuth{authenticated: true}, fakeGraph{}, nil, st)
+	srv := newDoctorServer(t, &fakeAuth{authenticated: true}, fakeGraph{}, nil, st)
 
 	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
 	w := httptest.NewRecorder()
@@ -429,7 +442,7 @@ func TestHandleDoctor_llmFail(t *testing.T) {
 		events: []graph.Event{{ID: "e1"}},
 	}
 	lc := fakeLLM{err: fmt.Errorf("rate limit exceeded")}
-	srv := newDoctorServer(t, fakeAuth{authenticated: true}, gc, lc, st)
+	srv := newDoctorServer(t, &fakeAuth{authenticated: true}, gc, lc, st)
 
 	req := httptest.NewRequest(http.MethodGet, "/doctor", nil)
 	w := httptest.NewRecorder()
@@ -530,7 +543,7 @@ func TestHandleSummaryPage_emptyState(t *testing.T) {
 	// GET / with no cached report → empty state + Generate button, no API calls.
 	st := newMemStore(t)
 	lc := fakeLLM{reply: "should not be called"}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, fakeGraph{}, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, fakeGraph{}, lc, nil, st)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
@@ -558,7 +571,7 @@ func TestHandleGenerate_storesAndRedirects(t *testing.T) {
 		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
 	}
 	lc := fakeLLM{reply: "LLM summary"}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, nil, st)
 
 	// Trigger generation via HTTP — should redirect to /generating.
 	req := httptest.NewRequest(http.MethodPost, "/generate", nil)
@@ -606,7 +619,7 @@ func TestHandleGenerate_pageRefreshDoesNotRegenerate(t *testing.T) {
 	}
 	calls := 0
 	lc := &callCountLLM{reply: "LLM summary", counter: &calls}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, nil, st)
 
 	// One generate (synchronous, to populate the cache reliably).
 	if _, err := srv.GenerateBriefing(context.Background()); err != nil {
@@ -634,7 +647,7 @@ func TestHandleSummaryPage_githubSection(t *testing.T) {
 		{Number: 42, Title: "Fix the bug", Repo: "acme/backend", State: "closed", MergedAt: &merged, UpdatedAt: merged},
 	}}
 	lc := fakeLLM{reply: "Here is your GitHub PR summary."}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, ghc, st)
 
 	// Generate first.
 	_, _ = srv.GenerateBriefing(context.Background())
@@ -663,7 +676,7 @@ func TestHandleSummaryPage_githubNotConfigured(t *testing.T) {
 		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
 	}
 	lc := fakeLLM{reply: "summary"}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, nil, st)
 
 	_, _ = srv.GenerateBriefing(context.Background())
 
@@ -687,7 +700,7 @@ func TestHandleSummaryPage_githubError(t *testing.T) {
 	}
 	ghc := fakeGitHub{err: fmt.Errorf("rate limit exceeded")}
 	lc := fakeLLM{reply: "summary"}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, ghc, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, ghc, st)
 
 	_, _ = srv.GenerateBriefing(context.Background())
 
@@ -749,7 +762,7 @@ func TestGenerateBriefing_cachesLowPrioIDs(t *testing.T) {
 	}
 	// LLM returns "m1" as the low-priority ID for every chat call.
 	lc := fakeLLM{reply: `["m1"]`}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, nil, st)
 
 	rep, err := srv.GenerateBriefing(context.Background())
 	if err != nil {
@@ -797,7 +810,7 @@ func TestArchiveGraphLowPrio_usesCachedIDs(t *testing.T) {
 	// LLM should NOT be called — use a counter to verify.
 	callCount := 0
 	lc := &callCountLLM{reply: "[]", counter: &callCount}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, mover, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, mover, lc, nil, st)
 
 	n, errStr := srv.archiveGraphLowPrio(context.Background(), lc)
 	if errStr != "" {
@@ -823,7 +836,7 @@ func TestHandleSummaryPage_lowPrioSection(t *testing.T) {
 		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
 	}
 	lc := fakeLLM{reply: `["m1"]`}
-	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, gc, lc, nil, st)
 
 	_, _ = srv.GenerateBriefing(context.Background())
 
@@ -843,5 +856,85 @@ func TestHandleSummaryPage_lowPrioSection(t *testing.T) {
 	}
 	if !strings.Contains(body, "Move to Low-Priority Folder") {
 		t.Errorf("expected move button in low-priority section")
+	}
+}
+
+// --- handleDisconnect ---
+
+func TestHandleDisconnect_clearsTokenAndRedirects(t *testing.T) {
+	auth := &fakeAuth{authenticated: true}
+	srv := newTestServer(t, auth, newMemStore(t))
+
+	req := httptest.NewRequest(http.MethodPost, "/disconnect", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", w.Code)
+	}
+	if w.Header().Get("Location") != "/connect" {
+		t.Errorf("expected redirect to /connect, got %s", w.Header().Get("Location"))
+	}
+	if !auth.clearCalled {
+		t.Error("expected ClearToken to be called")
+	}
+}
+
+func TestHandleDisconnect_clearError(t *testing.T) {
+	auth := &fakeAuth{authenticated: true, clearErr: fmt.Errorf("db error")}
+	srv := newTestServer(t, auth, newMemStore(t))
+
+	req := httptest.NewRequest(http.MethodPost, "/disconnect", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on clear error, got %d", w.Code)
+	}
+}
+
+// --- handleConnect token expiry ---
+
+func TestHandleConnect_showsExpiry(t *testing.T) {
+	expiry := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	auth := &fakeAuth{authenticated: true, expiry: expiry}
+	srv := newTestServer(t, auth, newMemStore(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/connect", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Token expires") {
+		t.Errorf("expected token expiry text in connect page, got:\n%s", body)
+	}
+	// Disconnect button must appear when authenticated
+	if !strings.Contains(body, "Disconnect") {
+		t.Errorf("expected Disconnect button in connect page, got:\n%s", body)
+	}
+}
+
+func TestHandleConnect_notAuthenticated_showsSignIn(t *testing.T) {
+	auth := &fakeAuth{authenticated: false}
+	st := newMemStore(t)
+	_ = st.Set("setting.azure_client_id", "test-client-id")
+	srv := newTestServer(t, auth, st)
+
+	req := httptest.NewRequest(http.MethodGet, "/connect", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Sign in") {
+		t.Errorf("expected Sign in link when not authenticated, got:\n%s", body)
+	}
+	if strings.Contains(body, "Disconnect") {
+		t.Errorf("expected no Disconnect button when not authenticated")
 	}
 }
