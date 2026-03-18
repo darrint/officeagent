@@ -713,3 +713,135 @@ func (f *callCountLLM) Chat(_ context.Context, _ []llm.Message) (string, error) 
 	*f.counter++
 	return f.reply, nil
 }
+
+// fakeGraphMover extends fakeGraph with move support, implementing graphMoverService.
+type fakeGraphMover struct {
+	fakeGraph
+	movedIDs   []string
+	folderName string
+	folderErr  error
+	moveErr    error
+}
+
+func (f *fakeGraphMover) GetOrCreateFolder(_ context.Context, name string) (string, error) {
+	f.folderName = name
+	if f.folderErr != nil {
+		return "", f.folderErr
+	}
+	return "folder-id", nil
+}
+
+func (f *fakeGraphMover) MoveMessages(_ context.Context, ids []string, _ string) error {
+	if f.moveErr != nil {
+		return f.moveErr
+	}
+	f.movedIDs = append(f.movedIDs, ids...)
+	return nil
+}
+
+// TestGenerateBriefing_cachesLowPrioIDs verifies that GenerateBriefing stores
+// low-priority message IDs (returned by the LLM classifier) in the cached report.
+func TestGenerateBriefing_cachesLowPrioIDs(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", From: "spam@example.com", Subject: "Buy now!"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	// LLM returns "m1" as the low-priority ID for every chat call.
+	lc := fakeLLM{reply: `["m1"]`}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+
+	rep, err := srv.GenerateBriefing(context.Background())
+	if err != nil {
+		t.Fatalf("GenerateBriefing: %v", err)
+	}
+	if len(rep.LowPrioMsgs) == 0 {
+		t.Fatal("expected at least one low-priority message cached")
+	}
+	found := false
+	for _, m := range rep.LowPrioMsgs {
+		if m.ID == "m1" && m.Source == "graph" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected m1/graph in LowPrioMsgs, got %+v", rep.LowPrioMsgs)
+	}
+}
+
+// TestArchiveGraphLowPrio_usesCachedIDs verifies that archiveGraphLowPrio reads
+// IDs from the cached report instead of re-invoking the LLM classifier.
+func TestArchiveGraphLowPrio_usesCachedIDs(t *testing.T) {
+	st := newMemStore(t)
+	now := time.Now().UTC()
+
+	// Pre-populate the cache with a low-prio message.
+	rep := &cachedReport{
+		LowPrioMsgs: []lowPrioMsg{
+			{ID: "cached-id", Source: "graph", From: "spam@x.com", Subject: "Ad", ReceivedAt: now},
+		},
+		GeneratedAt: now,
+	}
+	if err := (&Server{store: st}).saveLastReport(rep); err != nil {
+		t.Fatalf("saveLastReport: %v", err)
+	}
+
+	mover := &fakeGraphMover{
+		fakeGraph: fakeGraph{
+			msgs:   []graph.Message{{ID: "cached-id", Subject: "Ad", From: "spam@x.com"}},
+			events: []graph.Event{},
+		},
+	}
+
+	// LLM should NOT be called — use a counter to verify.
+	callCount := 0
+	lc := &callCountLLM{reply: "[]", counter: &callCount}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, mover, lc, nil, st)
+
+	n, errStr := srv.archiveGraphLowPrio(context.Background(), lc)
+	if errStr != "" {
+		t.Fatalf("archiveGraphLowPrio error: %s", errStr)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 message moved, got %d", n)
+	}
+	if callCount != 0 {
+		t.Errorf("expected 0 LLM calls when cache is populated, got %d", callCount)
+	}
+	if len(mover.movedIDs) != 1 || mover.movedIDs[0] != "cached-id" {
+		t.Errorf("expected cached-id to be moved, got %v", mover.movedIDs)
+	}
+}
+
+// TestHandleSummaryPage_lowPrioSection verifies that the low-priority section
+// appears in the page when the cached report contains low-prio messages.
+func TestHandleSummaryPage_lowPrioSection(t *testing.T) {
+	st := newMemStore(t)
+	gc := fakeGraph{
+		msgs:   []graph.Message{{ID: "m1", From: "spam@example.com", Subject: "Buy now!"}},
+		events: []graph.Event{{ID: "e1", Subject: "Standup"}},
+	}
+	lc := fakeLLM{reply: `["m1"]`}
+	srv := newSummaryServer(t, fakeAuth{authenticated: true}, gc, lc, nil, st)
+
+	_, _ = srv.GenerateBriefing(context.Background())
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Low-priority mail") {
+		t.Errorf("expected low-priority section in page body")
+	}
+	if !strings.Contains(body, "Buy now!") {
+		t.Errorf("expected low-prio message subject in page body")
+	}
+	if !strings.Contains(body, "Move to Low-Priority Folder") {
+		t.Errorf("expected move button in low-priority section")
+	}
+}

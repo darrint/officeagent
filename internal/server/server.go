@@ -76,6 +76,16 @@ type classifyMsg struct {
 	Preview string
 }
 
+// lowPrioMsg is a message identified as low-priority during the assessment phase.
+// It carries enough metadata to display in the UI without a round-trip.
+type lowPrioMsg struct {
+	ID          string    `json:"id"`
+	Source      string    `json:"source"`       // "graph" or "fastmail"
+	From        string    `json:"from"`
+	Subject     string    `json:"subject"`
+	ReceivedAt  time.Time `json:"received_at"`
+}
+
 // archiveResult is returned as JSON from POST /archive-lowprio.
 type archiveResult struct {
 	FastmailMoved int    `json:"fastmail_moved"`
@@ -379,6 +389,18 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 .empty-state button:disabled{background:#99c0e8;cursor:not-allowed}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:.85em;height:.85em;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:.35em}
+.lowprio-list{list-style:none;margin:.5rem 0 0;padding:0}
+.lowprio-list li{display:flex;gap:.75rem;padding:.35rem 0;border-bottom:1px solid #f0f0f0;font-size:.82rem;color:#555;align-items:baseline}
+.lowprio-list li:last-child{border-bottom:none}
+.lowprio-list .lp-from{font-weight:600;color:#444;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;flex-shrink:0}
+.lowprio-list .lp-subj{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lowprio-list .lp-date{white-space:nowrap;color:#aaa;font-size:.78rem;flex-shrink:0}
+.lowprio-panel{padding:.75rem 1rem;background:#fafafa;border:1px solid #ececec;border-radius:8px;margin-top:.5rem}
+.lowprio-actions{display:flex;align-items:center;gap:1rem;margin-top:.75rem}
+.lowprio-actions button{background:#555;color:#fff;border:none;border-radius:6px;padding:.35rem .9rem;font-size:.82rem;font-weight:600;cursor:pointer}
+.lowprio-actions button:hover{background:#333}
+.lowprio-actions button:disabled{background:#aaa;cursor:not-allowed}
+.lowprio-actions .lp-result{font-size:.8rem;color:#555}
 </style>
 <script>
 function startGenerate() {
@@ -388,31 +410,31 @@ function startGenerate() {
 }
 function archiveLowPrio() {
   var btn = document.getElementById('archive-btn');
-  var out = document.getElementById('archive-result');
+  var out = document.getElementById('lp-result');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner" style="border-color:rgba(0,0,0,.2);border-top-color:#0078d4"></span>Archiving\u2026';
+  btn.innerHTML = '<span class="spinner" style="border-color:rgba(255,255,255,.3);border-top-color:#fff"></span>Moving\u2026';
   fetch('/archive-lowprio', {method:'POST'})
     .then(function(r){ return r.json(); })
     .then(function(d){
       btn.disabled = false;
-      btn.innerHTML = 'Move Low-Priority Mail';
+      btn.innerHTML = 'Move to Low-Priority Folder';
       var parts = [];
-      if (d.fastmail_moved > 0) parts.push('Fastmail: ' + d.fastmail_moved + ' archived');
-      if (d.graph_moved > 0) parts.push('Office 365: ' + d.graph_moved + ' archived');
+      if (d.fastmail_moved > 0) parts.push('Fastmail: ' + d.fastmail_moved + ' moved');
+      if (d.graph_moved > 0) parts.push('Office 365: ' + d.graph_moved + ' moved');
       if (d.fastmail_error) parts.push('Fastmail error: ' + d.fastmail_error);
       if (d.graph_error) parts.push('Office 365 error: ' + d.graph_error);
-      if (parts.length === 0) parts.push('No low-priority mail found.');
+      if (parts.length === 0) parts.push('No low-priority mail to move.');
       out.textContent = parts.join(' \u00b7 ');
     })
     .catch(function(e){
       btn.disabled = false;
-      btn.innerHTML = 'Move Low-Priority Mail';
+      btn.innerHTML = 'Move to Low-Priority Folder';
       out.textContent = 'Error: ' + e;
     });
 }
 function sendReport() {
   var btn = document.getElementById('send-report-btn');
-  var out = document.getElementById('archive-result');
+  var out = document.getElementById('send-result');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Sending\u2026';
   fetch('/send-report', {method:'POST'})
@@ -444,10 +466,9 @@ function sendReport() {
   <div class="gen-bar">
     <span>Generated {{.GeneratedAt}}</span>
     <button type="button" onclick="startGenerate()">Regenerate</button>
-    <button type="button" id="archive-btn" onclick="archiveLowPrio()">Move Low-Priority Mail</button>
     <button type="button" id="send-report-btn" onclick="sendReport()" style="background:#107c10">Send Now</button>
   </div>
-  <div id="archive-result" style="font-size:.82rem;color:#555;margin-bottom:.75rem;padding:0 1rem"></div>
+  <div id="send-result" style="font-size:.82rem;color:#555;margin-bottom:.75rem;padding:0 1rem"></div>
   <div class="section">
     <div class="section-title">Email</div>
     {{if .Email.Error}}<div class="error">{{.Email.Error}}</div>
@@ -504,6 +525,26 @@ function sendReport() {
     {{end}}
   </div>
   {{end}}
+  {{if .LowPrioMsgs}}
+  <details>
+    <summary>Low-priority mail ({{len .LowPrioMsgs}} message{{if gt (len .LowPrioMsgs) 1}}s{{end}} identified)</summary>
+    <div class="lowprio-panel">
+      <ul class="lowprio-list">
+        {{range .LowPrioMsgs}}
+        <li>
+          <span class="lp-from">{{.From}}</span>
+          <span class="lp-subj">{{.Subject}}</span>
+          <span class="lp-date">{{.ReceivedAt.Format "Jan 2 3:04 PM"}}</span>
+        </li>
+        {{end}}
+      </ul>
+      <div class="lowprio-actions">
+        <button type="button" id="archive-btn" onclick="archiveLowPrio()">Move to Low-Priority Folder</button>
+        <span id="lp-result" class="lp-result"></span>
+      </div>
+    </div>
+  </details>
+  {{end}}
   <details>
     <summary>Raw JSON</summary>
     <pre>{{.RawJSON}}</pre>
@@ -529,6 +570,7 @@ type pageData struct {
 	Calendar    sectionData
 	GitHub      sectionData
 	Fastmail    sectionData
+	LowPrioMsgs []lowPrioMsg
 	RawJSON     string
 	GeneratedAt string // empty = no cached report yet
 	FatalError  string
@@ -1021,7 +1063,30 @@ func classifyLowPriority(ctx context.Context, msgs []classifyMsg, llmC llmServic
 	return parseLLMIDs(reply), nil
 }
 
-// archiveFastmailLowPrio classifies and moves low-priority Fastmail messages.
+// cachedLowPrioIDs returns the IDs of low-priority messages for the given
+// source ("graph" or "fastmail") from the last cached report. Returns nil (not
+// an empty slice) when no cached report exists, signalling the caller to fall
+// back to live classification. Returns a non-empty errStr on store errors.
+func (s *Server) cachedLowPrioIDs(_ context.Context, source string) ([]string, string) {
+	rep, err := s.loadLastReport()
+	if err != nil {
+		return nil, fmt.Sprintf("load last report: %v", err)
+	}
+	if rep == nil || len(rep.LowPrioMsgs) == 0 {
+		return nil, ""
+	}
+	var ids []string
+	for _, m := range rep.LowPrioMsgs {
+		if m.Source == source {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, "" // may be empty slice (none for this source), which is valid
+}
+
+// archiveFastmailLowPrio moves low-priority Fastmail messages using IDs cached
+// during the last GenerateBriefing run. Falls back to live LLM classification
+// only when no cached IDs are available.
 // Returns count moved and error string (empty on success).
 func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (int, string) {
 	fmC, ok := s.getFMClient().(fastmailMoverService)
@@ -1030,20 +1095,29 @@ func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (i
 	}
 	folderName := s.getSetting("fastmail_lowprio_folder", "Low Priority")
 
-	rawMsgs, err := fmC.ListMessages(ctx, 30)
-	if err != nil {
-		return 0, fmt.Sprintf("list messages: %v", err)
-	}
-	msgs := make([]classifyMsg, len(rawMsgs))
-	for i, m := range rawMsgs {
-		msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+	// Use cached IDs from the last briefing generation if available.
+	ids, errStr := s.cachedLowPrioIDs(ctx, "fastmail")
+	if errStr != "" {
+		return 0, errStr
 	}
 
-	proposed, err := classifyLowPriority(ctx, msgs, llmC)
-	if err != nil {
-		return 0, err.Error()
+	// Fallback: re-classify live if no cached IDs.
+	if ids == nil {
+		rawMsgs, err := fmC.ListMessages(ctx, 30)
+		if err != nil {
+			return 0, fmt.Sprintf("list messages: %v", err)
+		}
+		msgs := make([]classifyMsg, len(rawMsgs))
+		for i, m := range rawMsgs {
+			msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+		}
+		proposed, err := classifyLowPriority(ctx, msgs, llmC)
+		if err != nil {
+			return 0, err.Error()
+		}
+		ids = filterToKnownIDs(proposed, msgs)
 	}
-	ids := filterToKnownIDs(proposed, msgs)
+
 	if len(ids) == 0 {
 		return 0, ""
 	}
@@ -1058,7 +1132,9 @@ func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (i
 	return len(ids), ""
 }
 
-// archiveGraphLowPrio classifies and moves low-priority Graph (Office 365) messages.
+// archiveGraphLowPrio moves low-priority Graph (Office 365) messages using IDs
+// cached during the last GenerateBriefing run. Falls back to live LLM
+// classification only when no cached IDs are available.
 // Returns count moved and error string (empty on success).
 func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (int, string) {
 	gC, ok := s.client.(graphMoverService)
@@ -1067,20 +1143,29 @@ func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (int,
 	}
 	folderName := s.getSetting("graph_lowprio_folder", "Low Priority")
 
-	rawMsgs, err := gC.ListMessages(ctx, 30)
-	if err != nil {
-		return 0, fmt.Sprintf("list messages: %v", err)
-	}
-	msgs := make([]classifyMsg, len(rawMsgs))
-	for i, m := range rawMsgs {
-		msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+	// Use cached IDs from the last briefing generation if available.
+	ids, errStr := s.cachedLowPrioIDs(ctx, "graph")
+	if errStr != "" {
+		return 0, errStr
 	}
 
-	proposed, err := classifyLowPriority(ctx, msgs, llmC)
-	if err != nil {
-		return 0, err.Error()
+	// Fallback: re-classify live if no cached IDs.
+	if ids == nil {
+		rawMsgs, err := gC.ListMessages(ctx, 30)
+		if err != nil {
+			return 0, fmt.Sprintf("list messages: %v", err)
+		}
+		msgs := make([]classifyMsg, len(rawMsgs))
+		for i, m := range rawMsgs {
+			msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+		}
+		proposed, err := classifyLowPriority(ctx, msgs, llmC)
+		if err != nil {
+			return 0, err.Error()
+		}
+		ids = filterToKnownIDs(proposed, msgs)
 	}
-	ids := filterToKnownIDs(proposed, msgs)
+
 	if len(ids) == 0 {
 		return 0, ""
 	}
@@ -1176,6 +1261,7 @@ func (s *Server) handleSummaryPage(w http.ResponseWriter, r *http.Request) {
 		Calendar:    sectionDataFromCache(cached.CalendarRaw, cached.CalendarError),
 		GitHub:      sectionDataFromCache(cached.GitHubRaw, cached.GitHubError),
 		Fastmail:    sectionDataFromCache(cached.FastmailRaw, cached.FastmailError),
+		LowPrioMsgs: cached.LowPrioMsgs,
 		RawJSON:     string(rawJSON),
 		GeneratedAt: cached.GeneratedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
 	})
@@ -1195,15 +1281,16 @@ func sectionDataFromCache(raw, errStr string) sectionData {
 // cachedReport is the serialised form of a generated morning briefing stored
 // in SQLite so that GET / can render without hitting any external APIs.
 type cachedReport struct {
-	EmailRaw       string    `json:"email_raw"`
-	CalendarRaw    string    `json:"calendar_raw"`
-	GitHubRaw      string    `json:"github_raw"`
-	FastmailRaw    string    `json:"fastmail_raw,omitempty"`
-	EmailError     string    `json:"email_error,omitempty"`
-	CalendarError  string    `json:"calendar_error,omitempty"`
-	GitHubError    string    `json:"github_error,omitempty"`
-	FastmailError  string    `json:"fastmail_error,omitempty"`
-	GeneratedAt    time.Time `json:"generated_at"`
+	EmailRaw       string       `json:"email_raw"`
+	CalendarRaw    string       `json:"calendar_raw"`
+	GitHubRaw      string       `json:"github_raw"`
+	FastmailRaw    string       `json:"fastmail_raw,omitempty"`
+	EmailError     string       `json:"email_error,omitempty"`
+	CalendarError  string       `json:"calendar_error,omitempty"`
+	GitHubError    string       `json:"github_error,omitempty"`
+	FastmailError  string       `json:"fastmail_error,omitempty"`
+	LowPrioMsgs    []lowPrioMsg `json:"low_prio_msgs,omitempty"`
+	GeneratedAt    time.Time    `json:"generated_at"`
 }
 
 const reportStoreKey = "report.last"
@@ -1255,10 +1342,16 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		return nil, fmt.Errorf("LLM not configured")
 	}
 
-	type emailResult struct{ section sectionData }
+	type emailResult struct {
+		section  sectionData
+		lowPrios []lowPrioMsg
+	}
 	type calResult struct{ section sectionData }
 	type ghResult struct{ section sectionData }
-	type fmResult struct{ section sectionData }
+	type fmResult struct {
+		section  sectionData
+		lowPrios []lowPrioMsg
+	}
 
 	emailCh := make(chan emailResult, 1)
 	calCh := make(chan calResult, 1)
@@ -1270,10 +1363,17 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		msgs, err := s.client.ListMessages(ctx, 20)
 		if err != nil {
 			emit("email:error", fmt.Sprintf("Email fetch failed: %v", err))
-			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}}
+			emailCh <- emailResult{section: sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}}
 			return
 		}
 		emit("email:llm", fmt.Sprintf("Summarising %d email(s) with AI...", len(msgs)))
+
+		// Build classifyMsg list from raw messages for low-prio classification.
+		classifyMsgs := make([]classifyMsg, len(msgs))
+		for i, m := range msgs {
+			classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+		}
+
 		var sb strings.Builder
 		if len(msgs) == 0 {
 			sb.WriteString("No recent messages.")
@@ -1299,11 +1399,40 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		})
 		if err != nil {
 			emit("email:error", fmt.Sprintf("Email AI summary failed: %v", err))
-			emailCh <- emailResult{sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}}
+			emailCh <- emailResult{section: sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}}
 			return
 		}
+
+		// Classify low-priority messages using the already-fetched list.
+		emit("email:classify", "Classifying low-priority work email...")
+		proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
+		var graphLowPrios []lowPrioMsg
+		if classErr != nil {
+			log.Printf("GenerateBriefing: classify graph low-prio: %v", classErr)
+		} else {
+			ids := filterToKnownIDs(proposed, classifyMsgs)
+			idSet := make(map[string]struct{}, len(ids))
+			for _, id := range ids {
+				idSet[id] = struct{}{}
+			}
+			for _, m := range msgs {
+				if _, ok := idSet[m.ID]; ok {
+					graphLowPrios = append(graphLowPrios, lowPrioMsg{
+						ID:         m.ID,
+						Source:     "graph",
+						From:       m.From,
+						Subject:    m.Subject,
+						ReceivedAt: m.ReceivedAt,
+					})
+				}
+			}
+		}
+
 		emit("email:done", "Work email summary ready.")
-		emailCh <- emailResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
+		emailCh <- emailResult{
+			section:  sectionData{HTML: renderMarkdown(reply), Raw: reply},
+			lowPrios: graphLowPrios,
+		}
 	}()
 
 	go func() {
@@ -1452,10 +1581,17 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		msgs, err := fmC.ListMessages(ctx, 20)
 		if err != nil {
 			emit("fastmail:error", fmt.Sprintf("Fastmail fetch failed: %v", err))
-			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}}
+			fmCh <- fmResult{section: sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}}
 			return
 		}
 		emit("fastmail:llm", fmt.Sprintf("Summarising %d personal email(s) with AI...", len(msgs)))
+
+		// Build classifyMsg list for low-prio classification.
+		classifyMsgs := make([]classifyMsg, len(msgs))
+		for i, m := range msgs {
+			classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+		}
+
 		var sb strings.Builder
 		if len(msgs) == 0 {
 			sb.WriteString("No recent messages.")
@@ -1481,11 +1617,40 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		})
 		if err != nil {
 			emit("fastmail:error", fmt.Sprintf("Fastmail AI summary failed: %v", err))
-			fmCh <- fmResult{sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}}
+			fmCh <- fmResult{section: sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}}
 			return
 		}
+
+		// Classify low-priority messages using the already-fetched list.
+		emit("fastmail:classify", "Classifying low-priority personal email...")
+		proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
+		var fmLowPrios []lowPrioMsg
+		if classErr != nil {
+			log.Printf("GenerateBriefing: classify fastmail low-prio: %v", classErr)
+		} else {
+			ids := filterToKnownIDs(proposed, classifyMsgs)
+			idSet := make(map[string]struct{}, len(ids))
+			for _, id := range ids {
+				idSet[id] = struct{}{}
+			}
+			for _, m := range msgs {
+				if _, ok := idSet[m.ID]; ok {
+					fmLowPrios = append(fmLowPrios, lowPrioMsg{
+						ID:         m.ID,
+						Source:     "fastmail",
+						From:       m.From,
+						Subject:    m.Subject,
+						ReceivedAt: m.ReceivedAt,
+					})
+				}
+			}
+		}
+
 		emit("fastmail:done", "Personal email summary ready.")
-		fmCh <- fmResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
+		fmCh <- fmResult{
+			section:  sectionData{HTML: renderMarkdown(reply), Raw: reply},
+			lowPrios: fmLowPrios,
+		}
 	}()
 
 	emailRes := <-emailCh
@@ -1502,6 +1667,7 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		CalendarError: calRes.section.Error,
 		GitHubError:   ghRes.section.Error,
 		FastmailError: fmRes.section.Error,
+		LowPrioMsgs:   append(emailRes.lowPrios, fmRes.lowPrios...),
 		GeneratedAt:   time.Now().UTC(),
 	}
 	if err := s.saveLastReport(rep); err != nil {
