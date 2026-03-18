@@ -249,6 +249,10 @@ func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
 
 // GetOrCreateMailbox returns the JMAP ID of the mailbox with the given name,
 // creating it if it does not exist.
+//
+// The JMAP spec does not define a standard name filter for Mailbox/query, so
+// we enumerate all mailboxes via Mailbox/query (no filter) + Mailbox/get and
+// match by name client-side.
 func (c *Client) GetOrCreateMailbox(ctx context.Context, name string) (string, error) {
 	sess, err := c.getSession(ctx)
 	if err != nil {
@@ -259,13 +263,12 @@ func (c *Client) GetOrCreateMailbox(ctx context.Context, name string) (string, e
 		return "", fmt.Errorf("no mail account in session")
 	}
 
-	// Query for an existing mailbox with this name.
+	// Step 1: get all mailbox IDs (no filter — name filter is non-standard).
 	resps, err := c.jmapCall(ctx, sess.APIURL, []interface{}{
 		[]interface{}{
 			"Mailbox/query",
 			map[string]interface{}{
 				"accountId": accountID,
-				"filter":    map[string]interface{}{"name": name},
 			},
 			"0",
 		},
@@ -273,14 +276,55 @@ func (c *Client) GetOrCreateMailbox(ctx context.Context, name string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("mailbox/query: %w", err)
 	}
+	var allIDs []string
 	if len(resps) > 0 {
 		var tuple []json.RawMessage
 		if err := json.Unmarshal(resps[0], &tuple); err == nil && len(tuple) >= 2 {
 			var args struct {
 				IDs []string `json:"ids"`
 			}
-			if err := json.Unmarshal(tuple[1], &args); err == nil && len(args.IDs) > 0 {
-				return args.IDs[0], nil
+			if err := json.Unmarshal(tuple[1], &args); err == nil {
+				allIDs = args.IDs
+			}
+		}
+	}
+
+	// Step 2: fetch name+id for all mailboxes and match client-side.
+	if len(allIDs) > 0 {
+		ids := make([]interface{}, len(allIDs))
+		for i, id := range allIDs {
+			ids[i] = id
+		}
+		resps2, err := c.jmapCall(ctx, sess.APIURL, []interface{}{
+			[]interface{}{
+				"Mailbox/get",
+				map[string]interface{}{
+					"accountId":  accountID,
+					"ids":        ids,
+					"properties": []string{"id", "name"},
+				},
+				"0",
+			},
+		})
+		if err != nil {
+			return "", fmt.Errorf("mailbox/get: %w", err)
+		}
+		if len(resps2) > 0 {
+			var tuple []json.RawMessage
+			if err := json.Unmarshal(resps2[0], &tuple); err == nil && len(tuple) >= 2 {
+				var getArgs struct {
+					List []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"list"`
+				}
+				if err := json.Unmarshal(tuple[1], &getArgs); err == nil {
+					for _, mb := range getArgs.List {
+						if mb.Name == name {
+							return mb.ID, nil
+						}
+					}
+				}
 			}
 		}
 	}
