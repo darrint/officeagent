@@ -1951,6 +1951,10 @@ h2{font-size:1.05rem;margin-bottom:1.25rem;color:#0078d4}
     }
   }
 
+  // terminal is set to true as soon as we receive a 'done' or 'error' event
+  // so that onerror (which fires when the server closes the stream normally)
+  // does not show the "Lost connection" message.
+  var terminal = false;
   var src = new EventSource('/generate/progress');
 
   src.onopen = function() {
@@ -1965,10 +1969,12 @@ h2{font-size:1.05rem;margin-bottom:1.25rem;color:#0078d4}
     if (pct !== undefined) { bar.style.width = pct + '%'; }
     statusLine.textContent = ev.Message;
     if (ev.Step === 'done') {
+      terminal = true;
       statusLine.textContent = 'Done! Redirecting…';
       src.close();
       setTimeout(function(){ window.location.href = '/'; }, 700);
     } else if (ev.Step === 'error') {
+      terminal = true;
       statusLine.textContent = 'Generation failed. Redirecting…';
       src.close();
       setTimeout(function(){ window.location.href = '/'; }, 1500);
@@ -1976,10 +1982,10 @@ h2{font-size:1.05rem;margin-bottom:1.25rem;color:#0078d4}
   };
 
   src.onerror = function() {
-    // If the SSE stream closes (server closed it normally after 'done'),
-    // the browser fires onerror. Only treat it as a real error if we haven't
-    // already received 'done'.
-    if (bar.style.width === '100%') return;
+    // The server closes the SSE stream after the terminal event; the browser
+    // fires onerror for that normal close. Suppress it if we already handled
+    // the terminal event.
+    if (terminal) return;
     statusLine.textContent = 'Lost connection. Redirecting to briefing…';
     src.close();
     setTimeout(function(){ window.location.href = '/'; }, 1000);
