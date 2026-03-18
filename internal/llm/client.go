@@ -55,6 +55,9 @@ func NewClient(githubToken, model string) *Client {
 // SetBaseURL overrides the API base URL. Intended for testing only.
 func (c *Client) SetBaseURL(u string) { c.baseURL = u }
 
+// SetTransport replaces the HTTP transport. Used to inject logging middleware.
+func (c *Client) SetTransport(t http.RoundTripper) { c.http.Transport = t }
+
 // Chat sends a conversation to the LLM and returns the assistant reply text.
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	body, err := json.Marshal(completionRequest{

@@ -145,6 +145,9 @@ func NewClient(auth *Auth) *Client {
 	}
 }
 
+// SetTransport replaces the HTTP transport. Used to inject logging middleware.
+func (c *Client) SetTransport(t http.RoundTripper) { c.http.Transport = t }
+
 // Message is a simplified representation of a mail message.
 type Message struct {
 	ID          string    `json:"id"`

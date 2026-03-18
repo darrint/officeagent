@@ -84,6 +84,9 @@ func NewClient(token string) *Client {
 // SetBaseURL overrides the API base URL. Intended for testing only.
 func (c *Client) SetBaseURL(u string) { c.baseURL = u }
 
+// SetTransport replaces the HTTP transport. Used to inject logging middleware.
+func (c *Client) SetTransport(t http.RoundTripper) { c.http.Transport = t }
+
 // SetMaxEnrichPRs sets the maximum number of PRs that will receive per-PR
 // enrichment API calls (reviews, comments, commits). Defaults to 20.
 func (c *Client) SetMaxEnrichPRs(n int) { c.maxEnrichPRs = n }
