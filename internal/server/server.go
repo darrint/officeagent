@@ -64,6 +64,12 @@ type fastmailMoverService interface {
 	MoveMessages(ctx context.Context, messageIDs []string, targetMailboxID string) error
 }
 
+// fastmailReadOnlyChecker is optionally implemented by the Fastmail client to
+// report whether the API token has write access.
+type fastmailReadOnlyChecker interface {
+	IsReadOnly(ctx context.Context) (bool, error)
+}
+
 // graphMoverService extends graphService with archive capabilities.
 type graphMoverService interface {
 	graphService
@@ -838,7 +844,7 @@ button:hover{background:#006cbd}
     <div class="card">
       <label for="fastmail_token">Fastmail API token{{if .FastmailTokenSet}}<span class="token-set">&#10003; Token is set</span>{{end}}</label>
       <input type="password" id="fastmail_token" name="fastmail_token" autocomplete="new-password" placeholder="Leave blank to keep existing token">
-      <p class="hint">Fastmail API token with mail scope for personal inbox summaries. Generate one at <code>app.fastmail.com/settings/security/tokens</code>. Never echoed back to the browser.</p>
+      <p class="hint">Fastmail API token for personal inbox summaries and mail moving. Generate one at <code>app.fastmail.com/settings/security/tokens</code> — select <strong>Mail (read-write)</strong> access (not read-only). Never echoed back to the browser.</p>
     </div>
     <div class="card">
       <label for="azure_client_id">Azure application (client) ID</label>
@@ -2597,6 +2603,14 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		} else {
 			cr.ok = true
 			cr.Detail = fmt.Sprintf("OK (%d message(s) accessible)", len(msgs))
+			// Check that the token has write access (needed for mail moving).
+			if checker, ok := fmC.(fastmailReadOnlyChecker); ok {
+				if readOnly, roErr := checker.IsReadOnly(ctx); roErr == nil && readOnly {
+					cr.ok = false
+					cr.warn = true
+					cr.Detail += " — token is read-only; mail moving will fail. Regenerate the Fastmail token with full (read+write) access."
+				}
+			}
 		}
 		ch <- result{4, cr}
 	}()

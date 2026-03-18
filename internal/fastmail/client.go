@@ -38,6 +38,17 @@ func NewClient(token string) *Client {
 // SetTransport replaces the HTTP transport. Used to inject logging middleware.
 func (c *Client) SetTransport(t http.RoundTripper) { c.httpCli.Transport = t }
 
+// IsReadOnly returns true if the Fastmail API token has read-only access.
+// Write operations (moving mail, creating mailboxes) require a token with full
+// access. Returns an error only if the session request itself fails.
+func (c *Client) IsReadOnly(ctx context.Context) (bool, error) {
+	sess, err := c.getSession(ctx)
+	if err != nil {
+		return false, err
+	}
+	return sess.isReadOnly(), nil
+}
+
 // Message is a simplified mail message returned by ListMessages.
 type Message struct {
 	ID          string
@@ -51,6 +62,47 @@ type Message struct {
 type jmapSession struct {
 	APIURL          string            `json:"apiUrl"`
 	PrimaryAccounts map[string]string `json:"primaryAccounts"`
+	Accounts        map[string]struct {
+		IsReadOnly bool `json:"isReadOnly"`
+	} `json:"accounts"`
+}
+
+// isReadOnly returns true if the account associated with the mail capability
+// is read-only (i.e. the API token lacks write permissions).
+func (s *jmapSession) isReadOnly() bool {
+	accountID, ok := s.PrimaryAccounts[mailCap]
+	if !ok {
+		return false
+	}
+	acct, ok := s.Accounts[accountID]
+	if !ok {
+		return false
+	}
+	return acct.IsReadOnly
+}
+
+// checkMethodError inspects a parsed JMAP method-response tuple and returns a
+// non-nil error if the method name is "error". It is a no-op for normal
+// responses.
+func checkMethodError(tuple []json.RawMessage) error {
+	if len(tuple) < 2 {
+		return nil
+	}
+	var name string
+	if err := json.Unmarshal(tuple[0], &name); err != nil || name != "error" {
+		return nil
+	}
+	var errArgs struct {
+		Type        string `json:"type"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(tuple[1], &errArgs); err != nil {
+		return fmt.Errorf("jmap method error (unparseable)")
+	}
+	if errArgs.Description != "" {
+		return fmt.Errorf("jmap %s: %s", errArgs.Type, errArgs.Description)
+	}
+	return fmt.Errorf("jmap error: %s", errArgs.Type)
 }
 
 // getSession fetches the JMAP session resource.
@@ -352,6 +404,9 @@ func (c *Client) GetOrCreateMailbox(ctx context.Context, name string) (string, e
 	if err := json.Unmarshal(resps[0], &tuple); err != nil || len(tuple) < 2 {
 		return "", fmt.Errorf("malformed Mailbox/set response")
 	}
+	if err := checkMethodError(tuple); err != nil {
+		return "", fmt.Errorf("mailbox/set: %w", err)
+	}
 	var setArgs struct {
 		Created map[string]struct {
 			ID string `json:"id"`
@@ -413,6 +468,9 @@ func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, targetMa
 	var tuple []json.RawMessage
 	if err := json.Unmarshal(resps[0], &tuple); err != nil || len(tuple) < 2 {
 		return fmt.Errorf("malformed Email/set response")
+	}
+	if err := checkMethodError(tuple); err != nil {
+		return fmt.Errorf("email/set: %w", err)
 	}
 	var setArgs struct {
 		NotUpdated map[string]struct {
