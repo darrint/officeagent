@@ -2249,12 +2249,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.auth.IsAuthenticated(r.Context()) {
-		if err := loginTmpl.Execute(w, loginData{Authenticated: true}); err != nil {
-			log.Printf("login template: %v", err)
-		}
-		return
-	}
+	// Always proceed to the OAuth flow — even when a token is already stored.
+	// prompt=consent (set in AuthCodeURL) ensures Azure re-presents the consent
+	// screen so newly-added scopes are granted. Skipping here was the reason
+	// re-authentication retained the old (narrower) scope set.
 
 	authURL, state, verifier, err := s.auth.AuthCodeURL(s.cfg.RedirectURI)
 	if err != nil {
