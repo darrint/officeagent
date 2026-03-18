@@ -347,6 +347,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/mail", s.handleMail)
 	s.mux.HandleFunc("GET /api/calendar", s.handleCalendar)
 	s.mux.HandleFunc("GET /api/llm/ping", s.handleLLMPing)
+	s.mux.HandleFunc("GET /reports", s.handleReportsList)
+	s.mux.HandleFunc("GET /reports/{id}", s.handleReportView)
 }
 
 // Run starts the HTTP server and blocks until it returns an error.
@@ -511,6 +513,7 @@ function sendReport() {
     <span>morning briefing</span>
     <a href="/connect">Connect</a>
     <a href="/settings">Settings</a>
+    <a href="/reports">History</a>
   </header>
   {{if .FatalError}}
   <div class="error">{{.FatalError}}</div>
@@ -1368,7 +1371,7 @@ func (s *Server) loadLastReport() (*cachedReport, error) {
 	return &r, nil
 }
 
-// saveLastReport persists the cached report to the store.
+// saveLastReport persists the cached report to the store (kv key + reports table).
 func (s *Server) saveLastReport(rep *cachedReport) error {
 	if s.store == nil {
 		return nil
@@ -1377,7 +1380,16 @@ func (s *Server) saveLastReport(rep *cachedReport) error {
 	if err != nil {
 		return fmt.Errorf("marshal report: %w", err)
 	}
-	return s.store.Set(reportStoreKey, string(b))
+	content := string(b)
+	// Keep the kv key for fast "latest" lookup.
+	if err := s.store.Set(reportStoreKey, content); err != nil {
+		return err
+	}
+	// Also append to the historical reports table.
+	if _, err := s.store.SaveReport(rep.GeneratedAt, content); err != nil {
+		log.Printf("save report history: %v", err)
+	}
+	return nil
 }
 
 // GenerateBriefing fetches data from all configured sources, asks the LLM for
@@ -2586,5 +2598,214 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("writeJSON: %v", err)
+	}
+}
+
+// --- reports history ---
+
+var reportsListTmpl = template.Must(template.New("reports-list").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>officeagent — Report History</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2rem 1rem;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
+header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
+header a{font-size:.82rem;color:#888;text-decoration:none}
+header a:hover{color:#0078d4}
+.card{background:#fff;border-radius:10px;padding:1.75rem 2rem;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+ul{list-style:none;padding:0;margin:0}
+li{border-bottom:1px solid #f0f0f0;padding:.6rem 0;display:flex;align-items:baseline;gap:1rem}
+li:last-child{border-bottom:none}
+li a{color:#0078d4;text-decoration:none;font-size:.9rem}
+li a:hover{text-decoration:underline}
+li span{font-size:.78rem;color:#aaa}
+.empty{color:#888;font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>officeagent</h1>
+    <span style="flex:1">report history</span>
+    <a href="/">← Morning briefing</a>
+  </header>
+  <div class="card">
+    {{if .Reports}}
+    <ul>
+      {{range .Reports}}
+      <li>
+        <a href="/reports/{{.ID}}">{{.GeneratedAt}}</a>
+        <span>#{{.ID}}</span>
+      </li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="empty">No historical reports yet. Generate a briefing to start building history.</p>
+    {{end}}
+  </div>
+</div>
+</body>
+</html>`))
+
+type reportsListItem struct {
+	ID          int64
+	GeneratedAt string
+}
+
+type reportsListData struct {
+	Reports []reportsListItem
+}
+
+func (s *Server) handleReportsList(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "store not initialised", http.StatusInternalServerError)
+		return
+	}
+	reps, err := s.store.ListReports()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list reports: %v", err), http.StatusInternalServerError)
+		return
+	}
+	items := make([]reportsListItem, len(reps))
+	for i, rep := range reps {
+		items[i] = reportsListItem{
+			ID:          rep.ID,
+			GeneratedAt: rep.GeneratedAt.In(easternLoc).Format("Mon Jan 2 2006 3:04 PM MST"),
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := reportsListTmpl.Execute(w, reportsListData{Reports: items}); err != nil {
+		log.Printf("reports-list template: %v", err)
+	}
+}
+
+var reportViewTmpl = template.Must(template.New("report-view").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>officeagent — Report {{.GeneratedAt}}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2rem 1rem;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
+header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
+header span{font-size:.85rem;color:#666;flex:1}
+header a{font-size:.82rem;color:#888;text-decoration:none}
+header a:hover{color:#0078d4}
+.section{margin-bottom:1.5rem}
+.section-title{font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#888;margin-bottom:.5rem}
+.card{background:#fff;border-radius:10px;padding:1.75rem 2rem;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h2,.card h3{margin:1.2em 0 .4em;font-size:1.05rem;color:#0078d4}
+.card h2:first-child,.card h3:first-child,.card p:first-child{margin-top:0}
+.card p{margin:.6em 0}
+.card ul,.card ol{margin:.6em 0 .6em 1.4em}
+.card li{margin:.25em 0}
+.card strong{font-weight:600}
+.card em{font-style:italic}
+.card code{background:#f0f0f0;padding:.1em .35em;border-radius:3px;font-size:.9em;font-family:monospace}
+.card pre{background:#f0f0f0;padding:1em;border-radius:6px;overflow-x:auto;font-size:.88em;line-height:1.5}
+.card pre code{background:none;padding:0}
+.card hr{border:none;border-top:1px solid #e8e8e8;margin:1.2em 0}
+.error{color:#c00;background:#fff0f0;border:1px solid #fcc;border-radius:8px;padding:1rem 1.25rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>officeagent</h1>
+    <span>{{.GeneratedAt}}</span>
+    <a href="/reports">← History</a>
+    <a href="/">Home</a>
+  </header>
+  {{if .Email.Error}}<div class="error">{{.Email.Error}}</div>
+  {{else if .Email.HTML}}
+  <div class="section">
+    <div class="section-title">Email</div>
+    <div class="card">{{.Email.HTML}}</div>
+  </div>
+  {{end}}
+  {{if .Calendar.Error}}<div class="error">{{.Calendar.Error}}</div>
+  {{else if .Calendar.HTML}}
+  <div class="section">
+    <div class="section-title">Calendar</div>
+    <div class="card">{{.Calendar.HTML}}</div>
+  </div>
+  {{end}}
+  {{if or .GitHub.Error .GitHub.HTML}}
+  <div class="section">
+    <div class="section-title">GitHub PRs</div>
+    {{if .GitHub.Error}}<div class="error">{{.GitHub.Error}}</div>
+    {{else}}<div class="card">{{.GitHub.HTML}}</div>{{end}}
+  </div>
+  {{end}}
+  {{if or .Fastmail.Error .Fastmail.HTML}}
+  <div class="section">
+    <div class="section-title">Personal Email (Fastmail)</div>
+    {{if .Fastmail.Error}}<div class="error">{{.Fastmail.Error}}</div>
+    {{else}}<div class="card">{{.Fastmail.HTML}}</div>{{end}}
+  </div>
+  {{end}}
+</div>
+</body>
+</html>`))
+
+type reportViewData struct {
+	GeneratedAt string
+	Email       sectionData
+	Calendar    sectionData
+	GitHub      sectionData
+	Fastmail    sectionData
+}
+
+func (s *Server) handleReportView(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "store not initialised", http.StatusInternalServerError)
+		return
+	}
+	rep, err := s.store.GetReport(id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("get report: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if rep == nil {
+		http.NotFound(w, r)
+		return
+	}
+	var cached cachedReport
+	if err := json.Unmarshal([]byte(rep.Content), &cached); err != nil {
+		http.Error(w, fmt.Sprintf("decode report: %v", err), http.StatusInternalServerError)
+		return
+	}
+	data := reportViewData{
+		GeneratedAt: rep.GeneratedAt.In(easternLoc).Format("Mon Jan 2 2006 3:04 PM MST"),
+		Email:       sectionDataFromCache(cached.EmailRaw, cached.EmailError),
+		Calendar:    sectionDataFromCache(cached.CalendarRaw, cached.CalendarError),
+		GitHub:      sectionDataFromCache(cached.GitHubRaw, cached.GitHubError),
+		Fastmail:    sectionDataFromCache(cached.FastmailRaw, cached.FastmailError),
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := reportViewTmpl.Execute(w, data); err != nil {
+		log.Printf("report-view template: %v", err)
 	}
 }

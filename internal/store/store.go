@@ -23,6 +23,13 @@ type Feedback struct {
 	CreatedAt time.Time
 }
 
+// Report is a historical briefing record.
+type Report struct {
+	ID          int64
+	GeneratedAt time.Time
+	Content     string // JSON blob of the full cachedReport
+}
+
 // New opens (or creates) the SQLite database at path and runs migrations.
 func New(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -71,6 +78,15 @@ func (s *Store) migrate() error {
 		)
 	`); err != nil {
 		return fmt.Errorf("create feedback table: %w", err)
+	}
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS reports (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			generated_at TEXT NOT NULL,
+			content      TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("create reports table: %w", err)
 	}
 	return nil
 }
@@ -131,4 +147,58 @@ func (s *Store) RecentFeedback(section string, limit int) ([]Feedback, error) {
 // Close closes the underlying database.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// SaveReport inserts a historical report record and returns the assigned ID.
+func (s *Store) SaveReport(generatedAt time.Time, content string) (int64, error) {
+	res, err := s.db.Exec(
+		"INSERT INTO reports(generated_at, content) VALUES(?, ?)",
+		generatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		content,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ListReports returns all historical report records, newest first.
+// Only id and generated_at are populated (content is omitted for efficiency).
+func (s *Store) ListReports() ([]Report, error) {
+	rows, err := s.db.Query(
+		"SELECT id, generated_at FROM reports ORDER BY id DESC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []Report
+	for rows.Next() {
+		var r Report
+		var ts string
+		if err := rows.Scan(&r.ID, &ts); err != nil {
+			return nil, err
+		}
+		r.GeneratedAt, _ = time.Parse("2006-01-02T15:04:05Z", ts)
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// GetReport returns a single report by ID, including content.
+func (s *Store) GetReport(id int64) (*Report, error) {
+	var r Report
+	var ts string
+	err := s.db.QueryRow(
+		"SELECT id, generated_at, content FROM reports WHERE id = ?", id,
+	).Scan(&r.ID, &ts, &r.Content)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.GeneratedAt, _ = time.Parse("2006-01-02T15:04:05Z", ts)
+	return &r, nil
 }
