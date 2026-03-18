@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/darrint/officeagent/internal/activitylog"
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/fastmail"
 	github "github.com/darrint/officeagent/internal/github"
@@ -185,12 +186,22 @@ type Server struct {
 	ghClient githubService
 	fmClient fastmailService
 	store    *store.Store
+	alog     *activitylog.Logger // may be nil; writes are no-ops via NewDiscard
 
 	clientMu      sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
 
 	progress *progressBus // SSE fan-out for briefing generation progress
+}
+
+// serverOption is a functional option for New.
+type serverOption func(*Server)
+
+// WithActivityLog sets the activity logger on the server. If not called the
+// server uses activitylog.NewDiscard() so all UI request logging is a no-op.
+func WithActivityLog(l *activitylog.Logger) serverOption {
+	return func(s *Server) { s.alog = l }
 }
 
 // getLLM returns the current LLM client, safe for concurrent use.
@@ -282,15 +293,20 @@ func (s *Server) reinitClients() {
 }
 
 // New creates a new Server with routes registered.
-func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, ghClient *github.Client, fmClient *fastmail.Client, st *store.Store) *Server {
+func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *llm.Client, ghClient *github.Client, fmClient *fastmail.Client, st *store.Store, opts ...serverOption) *Server {
 	s := &Server{
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
 		auth:          auth,
 		client:        client,
 		store:         st,
+		alog:          activitylog.NewDiscard(),
 		pendingLogins: make(map[string]pendingLogin),
 		progress:      newProgressBus(),
+	}
+	// Apply functional options (e.g. WithActivityLog).
+	for _, opt := range opts {
+		opt(s)
 	}
 	// Assign llmClient only when non-nil to preserve nil interface semantics.
 	// A typed nil (*llm.Client)(nil) assigned to an interface field would make
@@ -333,7 +349,37 @@ func (s *Server) routes() {
 // Run starts the HTTP server and blocks until it returns an error.
 func (s *Server) Run() error {
 	log.Printf("officeagent listening on %s", s.cfg.Addr)
-	return http.ListenAndServe(s.cfg.Addr, s.mux)
+	return http.ListenAndServe(s.cfg.Addr, s.uiLoggingMiddleware(s.mux))
+}
+
+// uiLoggingMiddleware wraps a handler and writes one activity log record per
+// inbound UI request (subsystem "ui") with method, path, status, and latency.
+func (s *Server) uiLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(lrw, r)
+		s.alog.Write(activitylog.Record{
+			Timestamp:  start.UTC(),
+			Direction:  "req",
+			Subsystem:  "ui",
+			Method:     r.Method,
+			URL:        r.URL.RequestURI(),
+			StatusCode: lrw.statusCode,
+			LatencyMS:  time.Since(start).Milliseconds(),
+		})
+	})
+}
+
+// loggingResponseWriter wraps http.ResponseWriter to capture the written status code.
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
 }
 
 // --- handlers ---
