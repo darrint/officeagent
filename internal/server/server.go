@@ -484,8 +484,8 @@ details pre{background:#1e1e1e;color:#d4d4d4;padding:1.25rem;border-radius:8px;f
 </style>
 <script>
 function startGenerate() {
-  fetch('/generate', {method:'POST', redirect:'follow'})
-    .then(function(r) { window.location.href = r.url; })
+  fetch('/generate', {method:'POST', redirect:'manual'})
+    .then(function() { window.location.href = '/generating'; })
     .catch(function() { window.location.href = '/generating'; });
 }
 function archiveLowPrio() {
@@ -1997,6 +1997,12 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	// Reset the progress bus NOW, before the redirect, so that any client
+	// subscribing to /generate/progress after this redirect cannot receive the
+	// stale "done" event from the previous run. GenerateBriefing also calls
+	// reset() at its start, but there is a race window between the goroutine
+	// launch and the client connecting that this early reset closes.
+	s.progress.reset()
 	// Launch generation in the background so the browser can navigate to the
 	// progress page immediately. Use a detached context so cancelling the
 	// request doesn't abort generation.
