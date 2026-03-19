@@ -1847,6 +1847,9 @@ func htmlEscape(s string) string {
 
 // sendNtfyReport loads the last cached report and sends it to ntfy.
 // Returns an error if the topic is not set, no report exists, or the send fails.
+// If the cached report has no OneDrive URLs yet (e.g. first run after the
+// feature was added, or Graph was not connected when the briefing was
+// generated), it attempts to upload the HTML now before sending.
 func (s *Server) sendNtfyReport(ctx context.Context) error {
 	topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
 	if topic == "" {
@@ -1859,6 +1862,23 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	if rep == nil {
 		return fmt.Errorf("no report generated yet")
 	}
+
+	// If the briefing has not been uploaded to OneDrive yet, try now so the
+	// notification includes a tap-to-open link.
+	if rep.BriefingDownloadURL == "" && rep.BriefingWebURL == "" && s.client != nil {
+		htmlContent := briefingHTML(rep)
+		item, uploadErr := s.client.WriteFile(ctx, "officeagent/briefing.html", "text/html", htmlContent)
+		if uploadErr != nil {
+			log.Printf("sendNtfyReport: OneDrive upload: %v", uploadErr)
+		} else {
+			rep.BriefingWebURL = item.WebURL
+			rep.BriefingDownloadURL = item.DownloadURL
+			if err := s.saveLastReport(rep); err != nil {
+				log.Printf("sendNtfyReport: save report with OneDrive URLs: %v", err)
+			}
+		}
+	}
+
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
 	body := briefingMarkdown(rep)
