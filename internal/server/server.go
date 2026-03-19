@@ -74,7 +74,9 @@ type fastmailReadOnlyChecker interface {
 type graphMoverService interface {
 	graphService
 	GetOrCreateFolder(ctx context.Context, name string) (string, error)
-	MoveMessages(ctx context.Context, messageIDs []string, folderID string) (int, error)
+	// MoveMessages moves messages to the given folder. Returns the number moved,
+	// the number skipped (already gone / not found), and any hard error.
+	MoveMessages(ctx context.Context, messageIDs []string, folderID string) (moved, skipped int, err error)
 }
 
 // classifyMsg is a compact message descriptor sent to the LLM for classification.
@@ -97,10 +99,11 @@ type lowPrioMsg struct {
 
 // archiveResult is returned as JSON from POST /archive-lowprio.
 type archiveResult struct {
-	FastmailMoved int    `json:"fastmail_moved"`
-	GraphMoved    int    `json:"graph_moved"`
-	FastmailError string `json:"fastmail_error,omitempty"`
-	GraphError    string `json:"graph_error,omitempty"`
+	FastmailMoved  int    `json:"fastmail_moved"`
+	GraphMoved     int    `json:"graph_moved"`
+	GraphSkipped   int    `json:"graph_skipped,omitempty"`
+	FastmailError  string `json:"fastmail_error,omitempty"`
+	GraphError     string `json:"graph_error,omitempty"`
 }
 
 // Default system prompts. Used when no custom prompt is stored.
@@ -500,7 +503,12 @@ function archiveLowPrio() {
       btn.innerHTML = 'Move to Low-Priority Folder';
       var parts = [];
       if (d.fastmail_moved > 0) parts.push('Fastmail: ' + d.fastmail_moved + ' moved');
-      if (d.graph_moved > 0) parts.push('Office 365: ' + d.graph_moved + ' moved');
+      if (d.graph_moved > 0 || d.graph_skipped > 0) {
+        var gParts = [];
+        if (d.graph_moved > 0) gParts.push(d.graph_moved + ' moved');
+        if (d.graph_skipped > 0) gParts.push(d.graph_skipped + ' already gone');
+        parts.push('Office 365: ' + gParts.join(', '));
+      }
       if (d.fastmail_error) parts.push('Fastmail error: ' + d.fastmail_error);
       if (d.graph_error) parts.push('Office 365 error: ' + d.graph_error);
       if (parts.length === 0) parts.push('No low-priority mail to move.');
@@ -1217,25 +1225,26 @@ func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (i
 // archiveGraphLowPrio moves low-priority Graph (Office 365) messages using IDs
 // cached during the last GenerateBriefing run. Falls back to live LLM
 // classification only when no cached IDs are available.
-// Returns count moved and error string (empty on success).
-func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (int, string) {
+// Returns count moved, count skipped (stale/not-found IDs), and error string
+// (empty on success). Partial results are returned alongside errors.
+func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (moved, skipped int, errStr string) {
 	gC, ok := s.client.(graphMoverService)
 	if !ok {
-		return 0, "" // Graph not configured or client doesn't support moving
+		return 0, 0, "" // Graph not configured or client doesn't support moving
 	}
 	folderName := s.getSetting("graph_lowprio_folder", "Low Priority")
 
 	// Use cached IDs from the last briefing generation if available.
-	ids, errStr := s.cachedLowPrioIDs(ctx, "graph")
-	if errStr != "" {
-		return 0, errStr
+	ids, es := s.cachedLowPrioIDs(ctx, "graph")
+	if es != "" {
+		return 0, 0, es
 	}
 
 	// Fallback: re-classify live if no cached IDs.
 	if ids == nil {
 		rawMsgs, err := gC.ListMessages(ctx, 30)
 		if err != nil {
-			return 0, fmt.Sprintf("list messages: %v", err)
+			return 0, 0, fmt.Sprintf("list messages: %v", err)
 		}
 		msgs := make([]classifyMsg, len(rawMsgs))
 		for i, m := range rawMsgs {
@@ -1243,24 +1252,25 @@ func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (int,
 		}
 		proposed, err := classifyLowPriority(ctx, msgs, llmC)
 		if err != nil {
-			return 0, err.Error()
+			return 0, 0, err.Error()
 		}
 		ids = filterToKnownIDs(proposed, msgs)
 	}
 
 	if len(ids) == 0 {
-		return 0, ""
+		return 0, 0, ""
 	}
 
 	folderID, err := gC.GetOrCreateFolder(ctx, folderName)
 	if err != nil {
-		return 0, fmt.Sprintf("get/create folder: %v", err)
+		return 0, 0, fmt.Sprintf("get/create folder: %v", err)
 	}
-	moved, err := gC.MoveMessages(ctx, ids, folderID)
-	if err != nil {
-		return moved, fmt.Sprintf("move messages: %v", err)
+	moved, skipped, moveErr := gC.MoveMessages(ctx, ids, folderID)
+	if moveErr != nil {
+		// Return partial counts alongside the error so the caller can report them.
+		return moved, skipped, fmt.Sprintf("move messages: %v", moveErr)
 	}
-	return moved, ""
+	return moved, skipped, ""
 }
 
 // handleArchiveLowPrio handles POST /archive-lowprio — classifies inbox messages
@@ -1290,8 +1300,9 @@ func (s *Server) handleArchiveLowPrio(w http.ResponseWriter, r *http.Request) {
 	}()
 	go func() {
 		defer wg.Done()
-		n, errStr := s.archiveGraphLowPrio(ctx, llmC)
+		n, sk, errStr := s.archiveGraphLowPrio(ctx, llmC)
 		result.GraphMoved = n
+		result.GraphSkipped = sk
 		result.GraphError = errStr
 	}()
 	wg.Wait()

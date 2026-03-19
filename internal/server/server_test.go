@@ -730,10 +730,11 @@ func (f *callCountLLM) Chat(_ context.Context, _ []llm.Message) (string, error) 
 // fakeGraphMover extends fakeGraph with move support, implementing graphMoverService.
 type fakeGraphMover struct {
 	fakeGraph
-	movedIDs   []string
-	folderName string
-	folderErr  error
-	moveErr    error
+	movedIDs     []string
+	folderName   string
+	folderErr    error
+	moveErr      error
+	fakeSkipped  int // how many IDs to report as skipped (not found)
 }
 
 func (f *fakeGraphMover) GetOrCreateFolder(_ context.Context, name string) (string, error) {
@@ -744,12 +745,18 @@ func (f *fakeGraphMover) GetOrCreateFolder(_ context.Context, name string) (stri
 	return "folder-id", nil
 }
 
-func (f *fakeGraphMover) MoveMessages(_ context.Context, ids []string, _ string) (int, error) {
+func (f *fakeGraphMover) MoveMessages(_ context.Context, ids []string, _ string) (moved, skipped int, err error) {
 	if f.moveErr != nil {
-		return 0, f.moveErr
+		return 0, 0, f.moveErr
 	}
-	f.movedIDs = append(f.movedIDs, ids...)
-	return len(ids), nil
+	// Simulate fakeSkipped IDs being not-found; the rest are moved.
+	skipped = f.fakeSkipped
+	if skipped > len(ids) {
+		skipped = len(ids)
+	}
+	moved = len(ids) - skipped
+	f.movedIDs = append(f.movedIDs, ids[skipped:]...)
+	return moved, skipped, nil
 }
 
 // TestGenerateBriefing_cachesLowPrioIDs verifies that GenerateBriefing stores
@@ -812,7 +819,7 @@ func TestArchiveGraphLowPrio_usesCachedIDs(t *testing.T) {
 	lc := &callCountLLM{reply: "[]", counter: &callCount}
 	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, mover, lc, nil, st)
 
-	n, errStr := srv.archiveGraphLowPrio(context.Background(), lc)
+	n, _, errStr := srv.archiveGraphLowPrio(context.Background(), lc)
 	if errStr != "" {
 		t.Fatalf("archiveGraphLowPrio error: %s", errStr)
 	}
@@ -824,6 +831,46 @@ func TestArchiveGraphLowPrio_usesCachedIDs(t *testing.T) {
 	}
 	if len(mover.movedIDs) != 1 || mover.movedIDs[0] != "cached-id" {
 		t.Errorf("expected cached-id to be moved, got %v", mover.movedIDs)
+	}
+}
+
+// TestArchiveGraphLowPrio_reportsSkippedIDs verifies that stale (not-found) message
+// IDs are counted and returned separately from moved IDs, without returning an error.
+func TestArchiveGraphLowPrio_reportsSkippedIDs(t *testing.T) {
+	st := newMemStore(t)
+	now := time.Now().UTC()
+
+	// Pre-populate cache with two IDs; one will be "not found" in the fake mover.
+	rep := &cachedReport{
+		LowPrioMsgs: []lowPrioMsg{
+			{ID: "stale-id", Source: "graph", From: "gone@x.com", Subject: "Old ad", ReceivedAt: now},
+			{ID: "live-id", Source: "graph", From: "spam@x.com", Subject: "New ad", ReceivedAt: now},
+		},
+		GeneratedAt: now,
+	}
+	if err := (&Server{store: st}).saveLastReport(rep); err != nil {
+		t.Fatalf("saveLastReport: %v", err)
+	}
+
+	mover := &fakeGraphMover{
+		fakeGraph: fakeGraph{
+			msgs:   []graph.Message{},
+			events: []graph.Event{},
+		},
+		fakeSkipped: 1, // first ID will be reported as not-found
+	}
+	lc := &callCountLLM{reply: "[]", counter: new(int)}
+	srv := newSummaryServer(t, &fakeAuth{authenticated: true}, mover, lc, nil, st)
+
+	moved, skipped, errStr := srv.archiveGraphLowPrio(context.Background(), lc)
+	if errStr != "" {
+		t.Fatalf("archiveGraphLowPrio error: %s", errStr)
+	}
+	if moved != 1 {
+		t.Errorf("expected 1 moved, got %d", moved)
+	}
+	if skipped != 1 {
+		t.Errorf("expected 1 skipped, got %d", skipped)
 	}
 }
 

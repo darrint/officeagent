@@ -380,15 +380,16 @@ func (c *Client) GetOrCreateFolder(ctx context.Context, name string) (string, er
 
 // MoveMessages moves the given message IDs to the target folder concurrently.
 // Each message requires a separate POST to /me/messages/{id}/move per Graph API.
-// Messages that are no longer found (404) are silently skipped — they may have
-// been deleted or already moved. Returns the number of messages actually moved.
-func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID string) (int, error) {
+// Messages that are no longer found (404/410) are skipped gracefully — they may
+// have been deleted or already moved. Returns the number of messages actually
+// moved and the number skipped due to not-found responses.
+func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID string) (moved, skipped int, err error) {
 	if len(messageIDs) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	type result struct {
-		id      string
-		err     error
+		id       string
+		err      error
 		notFound bool
 	}
 	results := make(chan result, len(messageIDs))
@@ -398,30 +399,30 @@ func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID
 		go func(msgID string) {
 			defer wg.Done()
 			path := "/me/messages/" + url.PathEscape(msgID) + "/move"
-			err := c.post(ctx, path, map[string]string{"destinationId": folderID}, nil)
-			notFound := err != nil && isGraphNotFound(err)
-			results <- result{id: msgID, err: err, notFound: notFound}
+			e := c.post(ctx, path, map[string]string{"destinationId": folderID}, nil)
+			notFound := e != nil && isGraphNotFound(e)
+			results <- result{id: msgID, err: e, notFound: notFound}
 		}(id)
 	}
 	wg.Wait()
 	close(results)
 
-	moved := 0
 	var errs []string
 	for r := range results {
 		switch {
 		case r.err == nil:
 			moved++
 		case r.notFound:
+			skipped++
 			log.Printf("MoveMessages: skipping %s (not found)", r.id)
 		default:
 			errs = append(errs, fmt.Sprintf("%s: %v", r.id, r.err))
 		}
 	}
 	if len(errs) > 0 {
-		return moved, fmt.Errorf("move errors: %s", errs[0])
+		return moved, skipped, fmt.Errorf("move errors: %s", errs[0])
 	}
-	return moved, nil
+	return moved, skipped, nil
 }
 
 // isGraphNotFound returns true if the error from a Graph API call indicates
