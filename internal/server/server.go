@@ -1811,38 +1811,51 @@ func briefingMarkdown(rep *cachedReport) string {
 }
 
 // briefingHTML formats a cachedReport as a self-contained HTML document
-// suitable for uploading to OneDrive. Sections with errors are omitted.
+// suitable for uploading to OneDrive. Markdown sections are rendered to HTML.
+// Sections with errors are omitted.
 func briefingHTML(rep *cachedReport) []byte {
 	var sb strings.Builder
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	sb.WriteString("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
 	sb.WriteString("<meta charset=\"utf-8\">\n")
 	fmt.Fprintf(&sb, "<title>7 AM Office Summary – %s</title>\n", date)
-	sb.WriteString("<style>body{font-family:sans-serif;max-width:800px;margin:2em auto;line-height:1.6}h1,h2{color:#222}pre{white-space:pre-wrap}</style>\n")
+	sb.WriteString("<style>")
+	sb.WriteString("body{font-family:sans-serif;max-width:800px;margin:2em auto;line-height:1.6}")
+	sb.WriteString("h1,h2,h3{color:#222}")
+	sb.WriteString("table{border-collapse:collapse;width:100%}")
+	sb.WriteString("th,td{border:1px solid #ccc;padding:6px 12px;text-align:left}")
+	sb.WriteString("tr:nth-child(even){background:#f9f9f9}")
+	sb.WriteString("code{background:#f4f4f4;padding:2px 4px;border-radius:3px}")
+	sb.WriteString("blockquote{border-left:4px solid #ccc;margin:0;padding-left:1em;color:#555}")
+	sb.WriteString("</style>\n")
 	sb.WriteString("</head>\n<body>\n")
 	fmt.Fprintf(&sb, "<h1>7 AM Office Summary &#8211; %s</h1>\n", date)
 	if rep.EmailRaw != "" {
-		fmt.Fprintf(&sb, "<h2>Work Email</h2>\n<pre>%s</pre>\n", htmlEscape(rep.EmailRaw))
+		fmt.Fprintf(&sb, "<h2>Work Email</h2>\n%s\n", markdownToHTML(rep.EmailRaw))
 	}
 	if rep.CalendarRaw != "" {
-		fmt.Fprintf(&sb, "<h2>Calendar</h2>\n<pre>%s</pre>\n", htmlEscape(rep.CalendarRaw))
+		fmt.Fprintf(&sb, "<h2>Calendar</h2>\n%s\n", markdownToHTML(rep.CalendarRaw))
 	}
 	if rep.GitHubRaw != "" {
-		fmt.Fprintf(&sb, "<h2>GitHub PRs</h2>\n<pre>%s</pre>\n", htmlEscape(rep.GitHubRaw))
+		fmt.Fprintf(&sb, "<h2>GitHub PRs</h2>\n%s\n", markdownToHTML(rep.GitHubRaw))
 	}
 	if rep.FastmailRaw != "" {
-		fmt.Fprintf(&sb, "<h2>Personal Email</h2>\n<pre>%s</pre>\n", htmlEscape(rep.FastmailRaw))
+		fmt.Fprintf(&sb, "<h2>Personal Email</h2>\n%s\n", markdownToHTML(rep.FastmailRaw))
 	}
 	sb.WriteString("</body>\n</html>\n")
 	return []byte(sb.String())
 }
 
-// htmlEscape escapes s for safe inclusion inside HTML element content.
-func htmlEscape(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	return s
+// markdownToHTML converts a Markdown string to an HTML fragment using goldmark.
+// On error it falls back to HTML-escaped plain text wrapped in a <pre>.
+func markdownToHTML(md string) string {
+	var buf bytes.Buffer
+	if err := mdRenderer.Convert([]byte(md), &buf); err != nil {
+		// Fallback: escape and wrap in <pre> so content is still readable.
+		r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+		return "<pre>" + r.Replace(md) + "</pre>"
+	}
+	return buf.String()
 }
 
 // sendNtfyReport loads the last cached report and sends it to ntfy.
