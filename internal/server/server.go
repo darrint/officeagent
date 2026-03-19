@@ -1882,11 +1882,12 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
 
-	// Use the pre-auth download URL as the tap target; fall back to the
-	// browser webUrl (requires Microsoft sign-in) if downloadUrl is absent.
-	clickURL := rep.BriefingDownloadURL
+	// Use the OneDrive viewer URL (webUrl) as the tap target — it renders the
+	// HTML in-browser on iOS. Fall back to the pre-auth downloadUrl if webUrl
+	// is absent.
+	clickURL := rep.BriefingWebURL
 	if clickURL == "" {
-		clickURL = rep.BriefingWebURL
+		clickURL = rep.BriefingDownloadURL
 	}
 
 	// When a link is available, send a short prompt so the notification body
