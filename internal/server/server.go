@@ -1881,12 +1881,22 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
-	body := briefingMarkdown(rep)
+
 	// Use the pre-auth download URL as the tap target; fall back to the
 	// browser webUrl (requires Microsoft sign-in) if downloadUrl is absent.
 	clickURL := rep.BriefingDownloadURL
 	if clickURL == "" {
 		clickURL = rep.BriefingWebURL
+	}
+
+	// When a link is available, send a short prompt so the notification body
+	// isn't truncated markdown — the full briefing is in the linked document.
+	// Fall back to the full markdown when no OneDrive upload succeeded.
+	var body string
+	if clickURL != "" {
+		body = "Tap to open your morning briefing."
+	} else {
+		body = briefingMarkdown(rep)
 	}
 	return ntfy.Send(ctx, topic, title, body, clickURL)
 }
