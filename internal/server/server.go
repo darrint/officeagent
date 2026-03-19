@@ -1449,332 +1449,307 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		return nil, fmt.Errorf("LLM not configured")
 	}
 
-	type emailResult struct {
-		section  sectionData
-		lowPrios []lowPrioMsg
-	}
-	type calResult struct{ section sectionData }
-	type ghResult struct{ section sectionData }
-	type fmResult struct {
-		section  sectionData
-		lowPrios []lowPrioMsg
-	}
-
-	emailCh := make(chan emailResult, 1)
-	calCh := make(chan calResult, 1)
-	ghCh := make(chan ghResult, 1)
-	fmCh := make(chan fmResult, 1)
-
-	go func() {
+	// Step 1: Graph email
+	var emailSection sectionData
+	var graphLowPrios []lowPrioMsg
+	{
 		emit("email:fetch", "Fetching work email...")
 		msgs, err := s.client.ListMessages(ctx, 20)
 		if err != nil {
 			emit("email:error", fmt.Sprintf("Email fetch failed: %v", err))
-			emailCh <- emailResult{section: sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}}
-			return
-		}
-		emit("email:llm", fmt.Sprintf("Summarising %d email(s) with AI...", len(msgs)))
-
-		// Build classifyMsg list from raw messages for low-prio classification.
-		classifyMsgs := make([]classifyMsg, len(msgs))
-		for i, m := range msgs {
-			classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
-		}
-
-		var sb strings.Builder
-		if len(msgs) == 0 {
-			sb.WriteString("No recent messages.")
+			emailSection = sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}
 		} else {
-			for _, m := range msgs {
-				fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
-					m.From,
-					m.Subject,
-					m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-					m.BodyPreview,
-				)
-			}
-		}
-		reply, err := llmC.Chat(ctx, []llm.Message{
-			{
-				Role: "system",
-				Content: buildSystemPrompt(
-					s.getPrompt("overall", defaultOverallPrompt),
-					s.getPrompt("email", defaultEmailPrompt)+s.feedbackContext("email"),
-				),
-			},
-			{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
-		})
-		if err != nil {
-			emit("email:error", fmt.Sprintf("Email AI summary failed: %v", err))
-			emailCh <- emailResult{section: sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}}
-			return
-		}
+			emit("email:llm", fmt.Sprintf("Summarising %d email(s) with AI...", len(msgs)))
 
-		// Classify low-priority messages using the already-fetched list.
-		emit("email:classify", "Classifying low-priority work email...")
-		proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
-		var graphLowPrios []lowPrioMsg
-		if classErr != nil {
-			log.Printf("GenerateBriefing: classify graph low-prio: %v", classErr)
-		} else {
-			ids := filterToKnownIDs(proposed, classifyMsgs)
-			idSet := make(map[string]struct{}, len(ids))
-			for _, id := range ids {
-				idSet[id] = struct{}{}
+			// Build classifyMsg list from raw messages for low-prio classification.
+			classifyMsgs := make([]classifyMsg, len(msgs))
+			for i, m := range msgs {
+				classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
 			}
-			for _, m := range msgs {
-				if _, ok := idSet[m.ID]; ok {
-					graphLowPrios = append(graphLowPrios, lowPrioMsg{
-						ID:         m.ID,
-						Source:     "graph",
-						From:       m.From,
-						Subject:    m.Subject,
-						ReceivedAt: m.ReceivedAt,
-					})
+
+			var sb strings.Builder
+			if len(msgs) == 0 {
+				sb.WriteString("No recent messages.")
+			} else {
+				for _, m := range msgs {
+					fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
+						m.From,
+						m.Subject,
+						m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+						m.BodyPreview,
+					)
 				}
 			}
+			reply, err := llmC.Chat(ctx, []llm.Message{
+				{
+					Role: "system",
+					Content: buildSystemPrompt(
+						s.getPrompt("overall", defaultOverallPrompt),
+						s.getPrompt("email", defaultEmailPrompt)+s.feedbackContext("email"),
+					),
+				},
+				{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
+			})
+			if err != nil {
+				emit("email:error", fmt.Sprintf("Email AI summary failed: %v", err))
+				emailSection = sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}
+			} else {
+				// Classify low-priority messages using the already-fetched list.
+				emit("email:classify", "Classifying low-priority work email...")
+				proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
+				if classErr != nil {
+					log.Printf("GenerateBriefing: classify graph low-prio: %v", classErr)
+				} else {
+					ids := filterToKnownIDs(proposed, classifyMsgs)
+					idSet := make(map[string]struct{}, len(ids))
+					for _, id := range ids {
+						idSet[id] = struct{}{}
+					}
+					for _, m := range msgs {
+						if _, ok := idSet[m.ID]; ok {
+							graphLowPrios = append(graphLowPrios, lowPrioMsg{
+								ID:         m.ID,
+								Source:     "graph",
+								From:       m.From,
+								Subject:    m.Subject,
+								ReceivedAt: m.ReceivedAt,
+							})
+						}
+					}
+				}
+				emit("email:done", "Work email summary ready.")
+				emailSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
+			}
 		}
+	}
 
-		emit("email:done", "Work email summary ready.")
-		emailCh <- emailResult{
-			section:  sectionData{HTML: renderMarkdown(reply), Raw: reply},
-			lowPrios: graphLowPrios,
-		}
-	}()
-
-	go func() {
+	// Step 2: Graph calendar
+	var calSection sectionData
+	{
 		emit("calendar:fetch", "Fetching calendar events...")
 		events, err := s.client.ListEvents(ctx, 20)
 		if err != nil {
 			emit("calendar:error", fmt.Sprintf("Calendar fetch failed: %v", err))
-			calCh <- calResult{sectionData{Error: fmt.Sprintf("Failed to fetch calendar: %v", err)}}
-			return
-		}
-		emit("calendar:llm", fmt.Sprintf("Summarising %d event(s) with AI...", len(events)))
-		var sb strings.Builder
-		if len(events) == 0 {
-			sb.WriteString("No upcoming events.")
+			calSection = sectionData{Error: fmt.Sprintf("Failed to fetch calendar: %v", err)}
 		} else {
-			for _, e := range events {
-				fmt.Fprintf(&sb, "- %s: %s to %s\n",
-					e.Subject,
-					e.Start.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-					e.End.In(easternLoc).Format("3:04 PM MST"),
-				)
+			emit("calendar:llm", fmt.Sprintf("Summarising %d event(s) with AI...", len(events)))
+			var sb strings.Builder
+			if len(events) == 0 {
+				sb.WriteString("No upcoming events.")
+			} else {
+				for _, e := range events {
+					fmt.Fprintf(&sb, "- %s: %s to %s\n",
+						e.Subject,
+						e.Start.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+						e.End.In(easternLoc).Format("3:04 PM MST"),
+					)
+				}
+			}
+			reply, err := llmC.Chat(ctx, []llm.Message{
+				{
+					Role: "system",
+					Content: buildSystemPrompt(
+						s.getPrompt("overall", defaultOverallPrompt),
+						s.getPrompt("calendar", defaultCalendarPrompt)+s.feedbackContext("calendar"),
+					),
+				},
+				{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
+			})
+			if err != nil {
+				emit("calendar:error", fmt.Sprintf("Calendar AI summary failed: %v", err))
+				calSection = sectionData{Error: fmt.Sprintf("LLM error (calendar): %v", err)}
+			} else {
+				emit("calendar:done", "Calendar summary ready.")
+				calSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
 			}
 		}
-		reply, err := llmC.Chat(ctx, []llm.Message{
-			{
-				Role: "system",
-				Content: buildSystemPrompt(
-					s.getPrompt("overall", defaultOverallPrompt),
-					s.getPrompt("calendar", defaultCalendarPrompt)+s.feedbackContext("calendar"),
-				),
-			},
-			{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
-		})
-		if err != nil {
-			emit("calendar:error", fmt.Sprintf("Calendar AI summary failed: %v", err))
-			calCh <- calResult{sectionData{Error: fmt.Sprintf("LLM error (calendar): %v", err)}}
-			return
-		}
-		emit("calendar:done", "Calendar summary ready.")
-		calCh <- calResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
-	}()
+	}
 
-	go func() {
+	// Step 3: GitHub PRs
+	var ghSection sectionData
+	{
 		if ghC == nil {
 			emit("github:skip", "GitHub not configured, skipping.")
-			ghCh <- ghResult{}
-			return
-		}
-		emit("github:fetch", "Fetching GitHub PRs...")
-		prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs(), s.githubUsername())
-		if err != nil {
-			emit("github:error", fmt.Sprintf("GitHub fetch failed: %v", err))
-			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}}
-			return
-		}
-		emit("github:llm", fmt.Sprintf("Summarising %d PR(s) with AI...", len(prs)))
-		var sb strings.Builder
-		if len(prs) == 0 {
-			sb.WriteString("No recent pull request activity.")
 		} else {
-			cutoff24h := time.Now().UTC().Add(-24 * time.Hour)
-
-			// Partition into newly opened (created in last 24h) vs active (older).
-			var newPRs, activePRs []github.PullRequest
-			for _, pr := range prs {
-				if pr.CreatedAt.After(cutoff24h) {
-					newPRs = append(newPRs, pr)
+			emit("github:fetch", "Fetching GitHub PRs...")
+			prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs(), s.githubUsername())
+			if err != nil {
+				emit("github:error", fmt.Sprintf("GitHub fetch failed: %v", err))
+				ghSection = sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}
+			} else {
+				emit("github:llm", fmt.Sprintf("Summarising %d PR(s) with AI...", len(prs)))
+				var sb strings.Builder
+				if len(prs) == 0 {
+					sb.WriteString("No recent pull request activity.")
 				} else {
-					activePRs = append(activePRs, pr)
-				}
-			}
+					cutoff24h := time.Now().UTC().Add(-24 * time.Hour)
 
-			writePR := func(pr github.PullRequest) {
-				status := pr.State
-				if pr.MergedAt != nil {
-					status = "merged"
-				}
-				fmt.Fprintf(&sb, "- [%s#%d](%s) %s (%s) by %s — updated %s\n",
-					pr.Repo, pr.Number, pr.HTMLURL, pr.Title,
-					status, pr.Author,
-					pr.UpdatedAt.In(easternLoc).Format("Mon Jan 2 15:04"),
-				)
-				for _, r := range pr.Reviews {
-					fmt.Fprintf(&sb, "  - review by %s: %s (%s)\n",
-						r.Author, r.State,
-						r.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
-					)
-				}
-				for _, cm := range pr.Comments {
-					fmt.Fprintf(&sb, "  - comment by %s (%s): %s\n",
-						cm.Author,
-						cm.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
-						cm.Body,
-					)
-				}
-				for _, co := range pr.RecentCommits {
-					fmt.Fprintf(&sb, "  - commit %s by %s (%s): %s\n",
-						co.SHA, co.Author,
-						co.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
-						co.Message,
-					)
-				}
-			}
+					// Partition into newly opened (created in last 24h) vs active (older).
+					var newPRs, activePRs []github.PullRequest
+					for _, pr := range prs {
+						if pr.CreatedAt.After(cutoff24h) {
+							newPRs = append(newPRs, pr)
+						} else {
+							activePRs = append(activePRs, pr)
+						}
+					}
 
-			if len(newPRs) > 0 {
-				sb.WriteString("### New PRs opened today\n")
-				for _, pr := range newPRs {
-					writePR(pr)
+					writePR := func(pr github.PullRequest) {
+						status := pr.State
+						if pr.MergedAt != nil {
+							status = "merged"
+						}
+						fmt.Fprintf(&sb, "- [%s#%d](%s) %s (%s) by %s — updated %s\n",
+							pr.Repo, pr.Number, pr.HTMLURL, pr.Title,
+							status, pr.Author,
+							pr.UpdatedAt.In(easternLoc).Format("Mon Jan 2 15:04"),
+						)
+						for _, r := range pr.Reviews {
+							fmt.Fprintf(&sb, "  - review by %s: %s (%s)\n",
+								r.Author, r.State,
+								r.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
+							)
+						}
+						for _, cm := range pr.Comments {
+							fmt.Fprintf(&sb, "  - comment by %s (%s): %s\n",
+								cm.Author,
+								cm.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
+								cm.Body,
+							)
+						}
+						for _, co := range pr.RecentCommits {
+							fmt.Fprintf(&sb, "  - commit %s by %s (%s): %s\n",
+								co.SHA, co.Author,
+								co.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
+								co.Message,
+							)
+						}
+					}
+
+					if len(newPRs) > 0 {
+						sb.WriteString("### New PRs opened today\n")
+						for _, pr := range newPRs {
+							writePR(pr)
+						}
+						sb.WriteString("\n")
+					}
+					if len(activePRs) > 0 {
+						sb.WriteString("### Active PRs with recent updates\n")
+						for _, pr := range activePRs {
+							writePR(pr)
+						}
+					}
 				}
-				sb.WriteString("\n")
-			}
-			if len(activePRs) > 0 {
-				sb.WriteString("### Active PRs with recent updates\n")
-				for _, pr := range activePRs {
-					writePR(pr)
+				reply, err := llmC.Chat(ctx, []llm.Message{
+					{
+						Role: "system",
+						Content: buildSystemPrompt(
+							s.getPrompt("overall", defaultOverallPrompt),
+							s.getPrompt("github", defaultGitHubPrompt)+s.feedbackContext("github"),
+						),
+					},
+					{Role: "user", Content: "Here is my recent GitHub pull request activity:\n\n" + sb.String()},
+				})
+				if err != nil {
+					emit("github:error", fmt.Sprintf("GitHub AI summary failed: %v", err))
+					ghSection = sectionData{Error: fmt.Sprintf("LLM error (github): %v", err)}
+				} else {
+					emit("github:done", "GitHub PR summary ready.")
+					ghSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
 				}
 			}
 		}
-		reply, err := llmC.Chat(ctx, []llm.Message{
-			{
-				Role: "system",
-				Content: buildSystemPrompt(
-					s.getPrompt("overall", defaultOverallPrompt),
-					s.getPrompt("github", defaultGitHubPrompt)+s.feedbackContext("github"),
-				),
-			},
-			{Role: "user", Content: "Here is my recent GitHub pull request activity:\n\n" + sb.String()},
-		})
-		if err != nil {
-			emit("github:error", fmt.Sprintf("GitHub AI summary failed: %v", err))
-			ghCh <- ghResult{sectionData{Error: fmt.Sprintf("LLM error (github): %v", err)}}
-			return
-		}
-		emit("github:done", "GitHub PR summary ready.")
-		ghCh <- ghResult{sectionData{HTML: renderMarkdown(reply), Raw: reply}}
-	}()
+	}
 
-	go func() {
+	// Step 4: Fastmail
+	var fmSection sectionData
+	var fmLowPrios []lowPrioMsg
+	{
 		fmC := s.getFMClient()
 		if fmC == nil {
 			emit("fastmail:skip", "Fastmail not configured, skipping.")
-			fmCh <- fmResult{}
-			return
-		}
-		emit("fastmail:fetch", "Fetching Fastmail inbox...")
-		msgs, err := fmC.ListMessages(ctx, 20)
-		if err != nil {
-			emit("fastmail:error", fmt.Sprintf("Fastmail fetch failed: %v", err))
-			fmCh <- fmResult{section: sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}}
-			return
-		}
-		emit("fastmail:llm", fmt.Sprintf("Summarising %d personal email(s) with AI...", len(msgs)))
-
-		// Build classifyMsg list for low-prio classification.
-		classifyMsgs := make([]classifyMsg, len(msgs))
-		for i, m := range msgs {
-			classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
-		}
-
-		var sb strings.Builder
-		if len(msgs) == 0 {
-			sb.WriteString("No recent messages.")
 		} else {
-			for _, m := range msgs {
-				fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
-					m.From,
-					m.Subject,
-					m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-					m.BodyPreview,
-				)
-			}
-		}
-		reply, err := llmC.Chat(ctx, []llm.Message{
-			{
-				Role: "system",
-				Content: buildSystemPrompt(
-					s.getPrompt("overall", defaultOverallPrompt),
-					s.getPrompt("fastmail", defaultFastmailPrompt)+s.feedbackContext("fastmail"),
-				),
-			},
-			{Role: "user", Content: "Here are my recent personal emails:\n\n" + sb.String()},
-		})
-		if err != nil {
-			emit("fastmail:error", fmt.Sprintf("Fastmail AI summary failed: %v", err))
-			fmCh <- fmResult{section: sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}}
-			return
-		}
+			emit("fastmail:fetch", "Fetching Fastmail inbox...")
+			msgs, err := fmC.ListMessages(ctx, 20)
+			if err != nil {
+				emit("fastmail:error", fmt.Sprintf("Fastmail fetch failed: %v", err))
+				fmSection = sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}
+			} else {
+				emit("fastmail:llm", fmt.Sprintf("Summarising %d personal email(s) with AI...", len(msgs)))
 
-		// Classify low-priority messages using the already-fetched list.
-		emit("fastmail:classify", "Classifying low-priority personal email...")
-		proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
-		var fmLowPrios []lowPrioMsg
-		if classErr != nil {
-			log.Printf("GenerateBriefing: classify fastmail low-prio: %v", classErr)
-		} else {
-			ids := filterToKnownIDs(proposed, classifyMsgs)
-			idSet := make(map[string]struct{}, len(ids))
-			for _, id := range ids {
-				idSet[id] = struct{}{}
-			}
-			for _, m := range msgs {
-				if _, ok := idSet[m.ID]; ok {
-					fmLowPrios = append(fmLowPrios, lowPrioMsg{
-						ID:         m.ID,
-						Source:     "fastmail",
-						From:       m.From,
-						Subject:    m.Subject,
-						ReceivedAt: m.ReceivedAt,
-					})
+				// Build classifyMsg list for low-prio classification.
+				classifyMsgs := make([]classifyMsg, len(msgs))
+				for i, m := range msgs {
+					classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+				}
+
+				var sb strings.Builder
+				if len(msgs) == 0 {
+					sb.WriteString("No recent messages.")
+				} else {
+					for _, m := range msgs {
+						fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
+							m.From,
+							m.Subject,
+							m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
+							m.BodyPreview,
+						)
+					}
+				}
+				reply, err := llmC.Chat(ctx, []llm.Message{
+					{
+						Role: "system",
+						Content: buildSystemPrompt(
+							s.getPrompt("overall", defaultOverallPrompt),
+							s.getPrompt("fastmail", defaultFastmailPrompt)+s.feedbackContext("fastmail"),
+						),
+					},
+					{Role: "user", Content: "Here are my recent personal emails:\n\n" + sb.String()},
+				})
+				if err != nil {
+					emit("fastmail:error", fmt.Sprintf("Fastmail AI summary failed: %v", err))
+					fmSection = sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}
+				} else {
+					// Classify low-priority messages using the already-fetched list.
+					emit("fastmail:classify", "Classifying low-priority personal email...")
+					proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
+					if classErr != nil {
+						log.Printf("GenerateBriefing: classify fastmail low-prio: %v", classErr)
+					} else {
+						ids := filterToKnownIDs(proposed, classifyMsgs)
+						idSet := make(map[string]struct{}, len(ids))
+						for _, id := range ids {
+							idSet[id] = struct{}{}
+						}
+						for _, m := range msgs {
+							if _, ok := idSet[m.ID]; ok {
+								fmLowPrios = append(fmLowPrios, lowPrioMsg{
+									ID:         m.ID,
+									Source:     "fastmail",
+									From:       m.From,
+									Subject:    m.Subject,
+									ReceivedAt: m.ReceivedAt,
+								})
+							}
+						}
+					}
+					emit("fastmail:done", "Personal email summary ready.")
+					fmSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
 				}
 			}
 		}
-
-		emit("fastmail:done", "Personal email summary ready.")
-		fmCh <- fmResult{
-			section:  sectionData{HTML: renderMarkdown(reply), Raw: reply},
-			lowPrios: fmLowPrios,
-		}
-	}()
-
-	emailRes := <-emailCh
-	calRes := <-calCh
-	ghRes := <-ghCh
-	fmRes := <-fmCh
+	}
 
 	rep := &cachedReport{
-		EmailRaw:      emailRes.section.Raw,
-		CalendarRaw:   calRes.section.Raw,
-		GitHubRaw:     ghRes.section.Raw,
-		FastmailRaw:   fmRes.section.Raw,
-		EmailError:    emailRes.section.Error,
-		CalendarError: calRes.section.Error,
-		GitHubError:   ghRes.section.Error,
-		FastmailError: fmRes.section.Error,
-		LowPrioMsgs:   append(emailRes.lowPrios, fmRes.lowPrios...),
+		EmailRaw:      emailSection.Raw,
+		CalendarRaw:   calSection.Raw,
+		GitHubRaw:     ghSection.Raw,
+		FastmailRaw:   fmSection.Raw,
+		EmailError:    emailSection.Error,
+		CalendarError: calSection.Error,
+		GitHubError:   ghSection.Error,
+		FastmailError: fmSection.Error,
+		LowPrioMsgs:   append(graphLowPrios, fmLowPrios...),
 		GeneratedAt:   time.Now().UTC(),
 	}
 	if err := s.saveLastReport(rep); err != nil {
