@@ -416,6 +416,15 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 }
 
+// Flush implements http.Flusher by delegating to the underlying ResponseWriter
+// if it supports flushing. This is required for SSE (server-sent events) to
+// work through the logging middleware.
+func (lrw *loggingResponseWriter) Flush() {
+	if f, ok := lrw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // --- handlers ---
 
 var summaryTmpl = template.Must(template.New("summary").Parse(`<!DOCTYPE html>
