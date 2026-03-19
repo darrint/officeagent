@@ -41,6 +41,7 @@ type graphService interface {
 	ListMessages(ctx context.Context, top int) ([]graph.Message, error)
 	ListEvents(ctx context.Context, top int) ([]graph.Event, error)
 	WriteFile(ctx context.Context, path, contentType string, content []byte) (graph.DriveItem, error)
+	SendMail(ctx context.Context, subject, htmlBody string) error
 }
 
 // llmService is the subset of llm.Client used by the server.
@@ -1783,31 +1784,18 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 				log.Printf("save last report (with OneDrive URLs): %v", err)
 			}
 		}
+
+		// Email the briefing to the authenticated user so it appears in Outlook inbox.
+		emit("email", "Sending briefing email…")
+		date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
+		subject := "7 AM Office Summary – " + date
+		if mailErr := s.client.SendMail(ctx, subject, string(briefingHTML(rep))); mailErr != nil {
+			log.Printf("GenerateBriefing: SendMail: %v", mailErr)
+		}
 	}
 
 	emit("done", "Briefing complete.")
 	return rep, nil
-}
-
-// briefingMarkdown formats a cachedReport as a Markdown document suitable for
-// sending via ntfy. Sections with errors are omitted.
-func briefingMarkdown(rep *cachedReport) string {
-	var sb strings.Builder
-	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
-	fmt.Fprintf(&sb, "# 7 AM Office Summary – %s\n\n", date)
-	if rep.EmailRaw != "" {
-		fmt.Fprintf(&sb, "## Work Email\n\n%s\n\n", rep.EmailRaw)
-	}
-	if rep.CalendarRaw != "" {
-		fmt.Fprintf(&sb, "## Calendar\n\n%s\n\n", rep.CalendarRaw)
-	}
-	if rep.GitHubRaw != "" {
-		fmt.Fprintf(&sb, "## GitHub PRs\n\n%s\n\n", rep.GitHubRaw)
-	}
-	if rep.FastmailRaw != "" {
-		fmt.Fprintf(&sb, "## Personal Email\n\n%s\n\n", rep.FastmailRaw)
-	}
-	return strings.TrimRight(sb.String(), "\n")
 }
 
 // briefingHTML formats a cachedReport as a self-contained HTML document
@@ -1895,23 +1883,11 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
 
-	// Use the OneDrive viewer URL (webUrl) as the tap target — it renders the
-	// HTML in-browser on iOS. Fall back to the pre-auth downloadUrl if webUrl
-	// is absent.
-	clickURL := rep.BriefingWebURL
-	if clickURL == "" {
-		clickURL = rep.BriefingDownloadURL
-	}
+	// Tap link opens the Outlook inbox where the briefing email lands at the top.
+	clickURL := "https://outlook.office365.com/mail/inbox"
 
-	// When a link is available, send a short prompt so the notification body
-	// isn't truncated markdown — the full briefing is in the linked document.
-	// Fall back to the full markdown when no OneDrive upload succeeded.
-	var body string
-	if clickURL != "" {
-		body = "Tap to open your morning briefing."
-	} else {
-		body = briefingMarkdown(rep)
-	}
+	// Short body — the full briefing is in the Outlook email.
+	body := "Tap to open your morning briefing."
 	return ntfy.Send(ctx, topic, title, body, clickURL)
 }
 

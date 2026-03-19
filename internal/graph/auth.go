@@ -34,6 +34,7 @@ type Auth struct {
 var graphScopes = []string{
 	"Mail.Read",
 	"Mail.ReadWrite",
+	"Mail.Send",
 	"Calendars.Read",
 	"Files.ReadWrite",
 	"offline_access",
