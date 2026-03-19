@@ -63,6 +63,9 @@ func (f fakeGraph) ListMessages(_ context.Context, _ int) ([]graph.Message, erro
 func (f fakeGraph) ListEvents(_ context.Context, _ int) ([]graph.Event, error) {
 	return f.events, f.evtsErr
 }
+func (f fakeGraph) WriteFile(_ context.Context, _, _ string, _ []byte) (graph.DriveItem, error) {
+	return graph.DriveItem{}, nil
+}
 
 // fakeLLM implements llmService.
 type fakeLLM struct {

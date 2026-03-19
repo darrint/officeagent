@@ -19,7 +19,9 @@ const (
 // title is shown as the notification title.
 // body is the Markdown message body; it is silently truncated to 4096 bytes
 // (ntfy's limit) with a trailing indicator if it exceeds that.
-func Send(ctx context.Context, topic, title, body string) error {
+// clickURL, if non-empty, is sent as the Click header so tapping the
+// notification opens that URL (e.g. a pre-auth OneDrive download link).
+func Send(ctx context.Context, topic, title, body, clickURL string) error {
 	if topic == "" {
 		return fmt.Errorf("ntfy: topic is empty")
 	}
@@ -34,6 +36,9 @@ func Send(ctx context.Context, topic, title, body string) error {
 	req.Header.Set("Markdown", "yes")
 	req.Header.Set("Tags", "office,clock,summary")
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	if clickURL != "" {
+		req.Header.Set("Click", clickURL)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

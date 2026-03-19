@@ -40,6 +40,7 @@ type authService interface {
 type graphService interface {
 	ListMessages(ctx context.Context, top int) ([]graph.Message, error)
 	ListEvents(ctx context.Context, top int) ([]graph.Event, error)
+	WriteFile(ctx context.Context, path, contentType string, content []byte) (graph.DriveItem, error)
 }
 
 // llmService is the subset of llm.Client used by the server.
@@ -1384,16 +1385,18 @@ func sectionDataFromCache(raw, errStr string) sectionData {
 // cachedReport is the serialised form of a generated morning briefing stored
 // in SQLite so that GET / can render without hitting any external APIs.
 type cachedReport struct {
-	EmailRaw       string       `json:"email_raw"`
-	CalendarRaw    string       `json:"calendar_raw"`
-	GitHubRaw      string       `json:"github_raw"`
-	FastmailRaw    string       `json:"fastmail_raw,omitempty"`
-	EmailError     string       `json:"email_error,omitempty"`
-	CalendarError  string       `json:"calendar_error,omitempty"`
-	GitHubError    string       `json:"github_error,omitempty"`
-	FastmailError  string       `json:"fastmail_error,omitempty"`
-	LowPrioMsgs    []lowPrioMsg `json:"low_prio_msgs,omitempty"`
-	GeneratedAt    time.Time    `json:"generated_at"`
+	EmailRaw            string       `json:"email_raw"`
+	CalendarRaw         string       `json:"calendar_raw"`
+	GitHubRaw           string       `json:"github_raw"`
+	FastmailRaw         string       `json:"fastmail_raw,omitempty"`
+	EmailError          string       `json:"email_error,omitempty"`
+	CalendarError       string       `json:"calendar_error,omitempty"`
+	GitHubError         string       `json:"github_error,omitempty"`
+	FastmailError       string       `json:"fastmail_error,omitempty"`
+	LowPrioMsgs         []lowPrioMsg `json:"low_prio_msgs,omitempty"`
+	GeneratedAt         time.Time    `json:"generated_at"`
+	BriefingWebURL      string       `json:"briefing_web_url,omitempty"`
+	BriefingDownloadURL string       `json:"briefing_download_url,omitempty"`
 }
 
 const reportStoreKey = "report.last"
@@ -1764,6 +1767,24 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	if err := s.saveLastReport(rep); err != nil {
 		log.Printf("save last report: %v", err)
 	}
+
+	// Upload briefing to OneDrive so it can be linked from ntfy notifications.
+	if s.client != nil {
+		emit("upload", "Uploading briefing to OneDrive…")
+		htmlContent := briefingHTML(rep)
+		item, uploadErr := s.client.WriteFile(ctx, "officeagent/briefing.html", "text/html", htmlContent)
+		if uploadErr != nil {
+			log.Printf("GenerateBriefing: OneDrive upload: %v", uploadErr)
+		} else {
+			rep.BriefingWebURL = item.WebURL
+			rep.BriefingDownloadURL = item.DownloadURL
+			// Persist the updated URLs.
+			if err := s.saveLastReport(rep); err != nil {
+				log.Printf("save last report (with OneDrive URLs): %v", err)
+			}
+		}
+	}
+
 	emit("done", "Briefing complete.")
 	return rep, nil
 }
@@ -1789,6 +1810,41 @@ func briefingMarkdown(rep *cachedReport) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// briefingHTML formats a cachedReport as a self-contained HTML document
+// suitable for uploading to OneDrive. Sections with errors are omitted.
+func briefingHTML(rep *cachedReport) []byte {
+	var sb strings.Builder
+	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
+	sb.WriteString("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
+	sb.WriteString("<meta charset=\"utf-8\">\n")
+	fmt.Fprintf(&sb, "<title>7 AM Office Summary – %s</title>\n", date)
+	sb.WriteString("<style>body{font-family:sans-serif;max-width:800px;margin:2em auto;line-height:1.6}h1,h2{color:#222}pre{white-space:pre-wrap}</style>\n")
+	sb.WriteString("</head>\n<body>\n")
+	fmt.Fprintf(&sb, "<h1>7 AM Office Summary &#8211; %s</h1>\n", date)
+	if rep.EmailRaw != "" {
+		fmt.Fprintf(&sb, "<h2>Work Email</h2>\n<pre>%s</pre>\n", htmlEscape(rep.EmailRaw))
+	}
+	if rep.CalendarRaw != "" {
+		fmt.Fprintf(&sb, "<h2>Calendar</h2>\n<pre>%s</pre>\n", htmlEscape(rep.CalendarRaw))
+	}
+	if rep.GitHubRaw != "" {
+		fmt.Fprintf(&sb, "<h2>GitHub PRs</h2>\n<pre>%s</pre>\n", htmlEscape(rep.GitHubRaw))
+	}
+	if rep.FastmailRaw != "" {
+		fmt.Fprintf(&sb, "<h2>Personal Email</h2>\n<pre>%s</pre>\n", htmlEscape(rep.FastmailRaw))
+	}
+	sb.WriteString("</body>\n</html>\n")
+	return []byte(sb.String())
+}
+
+// htmlEscape escapes s for safe inclusion inside HTML element content.
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
 // sendNtfyReport loads the last cached report and sends it to ntfy.
 // Returns an error if the topic is not set, no report exists, or the send fails.
 func (s *Server) sendNtfyReport(ctx context.Context) error {
@@ -1806,7 +1862,13 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
 	body := briefingMarkdown(rep)
-	return ntfy.Send(ctx, topic, title, body)
+	// Use the pre-auth download URL as the tap target; fall back to the
+	// browser webUrl (requires Microsoft sign-in) if downloadUrl is absent.
+	clickURL := rep.BriefingDownloadURL
+	if clickURL == "" {
+		clickURL = rep.BriefingWebURL
+	}
+	return ntfy.Send(ctx, topic, title, body, clickURL)
 }
 
 // StartScheduler launches a background goroutine that wakes at 7:00 AM local

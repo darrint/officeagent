@@ -425,6 +425,57 @@ func (c *Client) MoveMessages(ctx context.Context, messageIDs []string, folderID
 	return moved, skipped, nil
 }
 
+// DriveItem is the subset of a Graph driveItem response we care about after upload.
+type DriveItem struct {
+	// WebURL is the browser-accessible URL for the file (requires Microsoft login).
+	WebURL string `json:"webUrl"`
+	// DownloadURL is a pre-authenticated download URL (~1 hour expiry, no login required).
+	// It is only present in the upload response and not in subsequent GETs.
+	DownloadURL string `json:"@microsoft.graph.downloadUrl"`
+}
+
+// WriteFile uploads content to the authenticated user's OneDrive at the given
+// path (relative to drive root, e.g. "officeagent/briefing.html") using a
+// simple PUT request. The folder is created automatically by Graph if it does
+// not exist. Returns a DriveItem containing webUrl and the pre-auth
+// downloadUrl (may be empty if Graph omits it).
+func (c *Client) WriteFile(ctx context.Context, path, contentType string, content []byte) (DriveItem, error) {
+	tok, err := c.auth.Token(ctx)
+	if err != nil {
+		return DriveItem{}, fmt.Errorf("get token: %w", err)
+	}
+	// PUT /me/drive/root:/{path}:/content
+	apiPath := c.baseURL + "/me/drive/root:/" + url.PathEscape(path) + ":/content"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, apiPath, bytes.NewReader(content))
+	if err != nil {
+		return DriveItem{}, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return DriveItem{}, fmt.Errorf("put file: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		var body struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return DriveItem{}, fmt.Errorf("graph %s: %s — %s", resp.Status, body.Error.Code, body.Error.Message)
+	}
+	var item DriveItem
+	if err := json.NewDecoder(resp.Body).Decode(&item); err != nil {
+		return DriveItem{}, fmt.Errorf("decode drive item: %w", err)
+	}
+	return item, nil
+}
+
 // isGraphNotFound returns true if the error from a Graph API call indicates
 // the resource was not found (HTTP 404 / ItemNotFound) or is gone (HTTP 410).
 func isGraphNotFound(err error) bool {

@@ -35,6 +35,7 @@ var graphScopes = []string{
 	"Mail.Read",
 	"Mail.ReadWrite",
 	"Calendars.Read",
+	"Files.ReadWrite",
 	"offline_access",
 }
 
