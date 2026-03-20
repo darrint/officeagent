@@ -20,6 +20,7 @@ import (
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/ntfy"
+	privatebinClient "github.com/darrint/officeagent/internal/privatebin"
 	"github.com/darrint/officeagent/internal/store"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
@@ -41,7 +42,6 @@ type graphService interface {
 	ListMessages(ctx context.Context, top int) ([]graph.Message, error)
 	ListEvents(ctx context.Context, top int) ([]graph.Event, error)
 	WriteFile(ctx context.Context, path, contentType string, content []byte) (graph.DriveItem, error)
-	SendMail(ctx context.Context, subject, htmlBody string) error
 }
 
 // llmService is the subset of llm.Client used by the server.
@@ -890,6 +890,11 @@ button:hover{background:#006cbd}
       <input type="text" id="ntfy_topic" name="ntfy_topic" value="{{.NtfyTopic}}" placeholder="your-secret-topic-name">
       <p class="hint">Secret ntfy.sh topic name for 7 AM daily briefing push notifications. Leave blank to disable. Create a topic at <code>ntfy.sh</code> — keep it secret.</p>
     </div>
+    <div class="card">
+      <label for="privatebin_url">PrivateBin instance URL</label>
+      <input type="text" id="privatebin_url" name="privatebin_url" value="{{.PrivateBinURL}}" placeholder="https://privatebin.net">
+      <p class="hint">URL of a PrivateBin instance used to host the briefing HTML. Leave blank to disable. Defaults to <code>https://privatebin.net</code>.</p>
+    </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
       {{if .Saved}}<span class="saved">&#10003; Saved</span>{{end}}
@@ -915,6 +920,7 @@ type settingsData struct {
 	FastmailLowPrioFolder  string
 	GraphLowPrioFolder     string
 	NtfyTopic              string // stored as setting.ntfy_topic; shown as password input
+	PrivateBinURL          string // stored as setting.privatebin_url
 	Saved                  bool
 }
 
@@ -939,6 +945,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		FastmailLowPrioFolder: s.getSetting("fastmail_lowprio_folder", "Low Priority"),
 		GraphLowPrioFolder:    s.getSetting("graph_lowprio_folder", "Low Priority"),
 		NtfyTopic:             s.getSetting("ntfy_topic", ""),
+		PrivateBinURL:         s.getSetting("privatebin_url", ""),
 		Saved:                 r.URL.Query().Get("saved") == "1",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -971,6 +978,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	fastmailLowPrioFolder := strings.TrimSpace(r.FormValue("fastmail_lowprio_folder"))
 	graphLowPrioFolder := strings.TrimSpace(r.FormValue("graph_lowprio_folder"))
 	ntfyTopic := strings.TrimSpace(r.FormValue("ntfy_topic"))
+	privateBinURL := strings.TrimSpace(r.FormValue("privatebin_url"))
 
 	if s.store != nil {
 		if err := s.store.Set("prompt.overall", overallPrompt); err != nil {
@@ -1036,6 +1044,10 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		// ntfy_topic is always saved (including empty string to clear it).
 		if err := s.store.Set("setting.ntfy_topic", ntfyTopic); err != nil {
 			log.Printf("store set setting.ntfy_topic: %v", err)
+		}
+		// privatebin_url is always saved (including empty string to clear it).
+		if err := s.store.Set("setting.privatebin_url", privateBinURL); err != nil {
+			log.Printf("store set setting.privatebin_url: %v", err)
 		}
 	}
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
@@ -1398,6 +1410,7 @@ type cachedReport struct {
 	GeneratedAt         time.Time    `json:"generated_at"`
 	BriefingWebURL      string       `json:"briefing_web_url,omitempty"`
 	BriefingDownloadURL string       `json:"briefing_download_url,omitempty"`
+	BriefingPasteURL    string       `json:"briefing_paste_url,omitempty"`
 }
 
 const reportStoreKey = "report.last"
@@ -1784,13 +1797,19 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 				log.Printf("save last report (with OneDrive URLs): %v", err)
 			}
 		}
+	}
 
-		// Email the briefing to the authenticated user so it appears in Outlook inbox.
-		emit("email", "Sending briefing email…")
-		date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
-		subject := "7 AM Office Summary – " + date
-		if mailErr := s.client.SendMail(ctx, subject, string(briefingHTML(rep))); mailErr != nil {
-			log.Printf("GenerateBriefing: SendMail: %v", mailErr)
+	// Post briefing to PrivateBin if a URL is configured.
+	if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
+		emit("paste", "Posting briefing to PrivateBin…")
+		pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingHTML(rep))
+		if pasteErr != nil {
+			log.Printf("GenerateBriefing: PrivateBin upload: %v", pasteErr)
+		} else {
+			rep.BriefingPasteURL = pasteURL
+			if err := s.saveLastReport(rep); err != nil {
+				log.Printf("save last report (with PrivateBin URL): %v", err)
+			}
 		}
 	}
 
@@ -1848,9 +1867,8 @@ func markdownToHTML(md string) string {
 
 // sendNtfyReport loads the last cached report and sends it to ntfy.
 // Returns an error if the topic is not set, no report exists, or the send fails.
-// If the cached report has no OneDrive URLs yet (e.g. first run after the
-// feature was added, or Graph was not connected when the briefing was
-// generated), it attempts to upload the HTML now before sending.
+// If the cached report has no PrivateBin paste URL yet, it attempts to post one
+// now so the notification includes a tap-to-open link.
 func (s *Server) sendNtfyReport(ctx context.Context) error {
 	topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
 	if topic == "" {
@@ -1864,18 +1882,17 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 		return fmt.Errorf("no report generated yet")
 	}
 
-	// If the briefing has not been uploaded to OneDrive yet, try now so the
-	// notification includes a tap-to-open link.
-	if rep.BriefingDownloadURL == "" && rep.BriefingWebURL == "" && s.client != nil {
-		htmlContent := briefingHTML(rep)
-		item, uploadErr := s.client.WriteFile(ctx, "officeagent/briefing.html", "text/html", htmlContent)
-		if uploadErr != nil {
-			log.Printf("sendNtfyReport: OneDrive upload: %v", uploadErr)
-		} else {
-			rep.BriefingWebURL = item.WebURL
-			rep.BriefingDownloadURL = item.DownloadURL
-			if err := s.saveLastReport(rep); err != nil {
-				log.Printf("sendNtfyReport: save report with OneDrive URLs: %v", err)
+	// If no PrivateBin paste exists yet for this report, try to create one now.
+	if rep.BriefingPasteURL == "" {
+		if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
+			pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingHTML(rep))
+			if pasteErr != nil {
+				log.Printf("sendNtfyReport: PrivateBin upload: %v", pasteErr)
+			} else {
+				rep.BriefingPasteURL = pasteURL
+				if err := s.saveLastReport(rep); err != nil {
+					log.Printf("sendNtfyReport: save report with paste URL: %v", err)
+				}
 			}
 		}
 	}
@@ -1883,11 +1900,23 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
 	title := "7 AM Office Update – " + date
 
-	// Tap link opens the Outlook inbox where the briefing email lands at the top.
-	clickURL := "https://outlook.office365.com/mail/inbox"
+	// Use the PrivateBin paste URL so tapping opens the briefing directly.
+	// Fall back to the OneDrive web URL, then the pre-auth download URL.
+	clickURL := rep.BriefingPasteURL
+	if clickURL == "" {
+		clickURL = rep.BriefingWebURL
+	}
+	if clickURL == "" {
+		clickURL = rep.BriefingDownloadURL
+	}
 
-	// Short body — the full briefing is in the Outlook email.
-	body := "Tap to open your morning briefing."
+	// Short body when a tap link is available; full markdown otherwise.
+	var body string
+	if clickURL != "" {
+		body = "Tap to open your morning briefing."
+	} else {
+		body = string(briefingHTML(rep))
+	}
 	return ntfy.Send(ctx, topic, title, body, clickURL)
 }
 
