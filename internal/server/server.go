@@ -892,7 +892,7 @@ button:hover{background:#006cbd}
     <div class="card">
       <label for="privatebin_url">PrivateBin instance URL</label>
       <input type="text" id="privatebin_url" name="privatebin_url" value="{{.PrivateBinURL}}" placeholder="https://privatebin.net">
-      <p class="hint">URL of a PrivateBin instance used to host the briefing HTML. Leave blank to disable. Defaults to <code>https://privatebin.net</code>.</p>
+      <p class="hint">URL of a PrivateBin instance used to host the briefing. Leave blank to use <code>https://privatebin.net</code>.</p>
     </div>
     <div class="actions">
       <button type="submit">Save prompts</button>
@@ -944,7 +944,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		FastmailLowPrioFolder: s.getSetting("fastmail_lowprio_folder", "Low Priority"),
 		GraphLowPrioFolder:    s.getSetting("graph_lowprio_folder", "Low Priority"),
 		NtfyTopic:             s.getSetting("ntfy_topic", ""),
-		PrivateBinURL:         s.getSetting("privatebin_url", ""),
+		PrivateBinURL:         s.getSetting("privatebin_url", "https://privatebin.net"),
 		Saved:                 r.URL.Query().Get("saved") == "1",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1780,7 +1780,7 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	}
 
 	// Post briefing to PrivateBin if a URL is configured.
-	pbURL := strings.TrimSpace(s.getSetting("privatebin_url", ""))
+		pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "https://privatebin.net"))
 	log.Printf("GenerateBriefing: privatebin_url=%q", pbURL)
 	if pbURL != "" {
 		emit("paste", "Posting briefing to PrivateBin…")
@@ -1841,7 +1841,7 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	// If no PrivateBin paste exists yet for this report, try to create one now.
 	log.Printf("sendNtfyReport: BriefingPasteURL=%q", rep.BriefingPasteURL)
 	if rep.BriefingPasteURL == "" {
-		pbURL := strings.TrimSpace(s.getSetting("privatebin_url", ""))
+	pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "https://privatebin.net"))
 		log.Printf("sendNtfyReport: privatebin_url=%q", pbURL)
 		if pbURL != "" {
 			pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
