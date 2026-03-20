@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/darrint/officeagent/internal/config"
+	agentgithub "github.com/darrint/officeagent/internal/agent/github"
+	agentgraph "github.com/darrint/officeagent/internal/agent/graph"
 	ghpkg "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
@@ -63,6 +65,12 @@ func (f fakeGraph) ListMessages(_ context.Context, _ int) ([]graph.Message, erro
 func (f fakeGraph) ListEvents(_ context.Context, _ int) ([]graph.Event, error) {
 	return f.events, f.evtsErr
 }
+func (f fakeGraph) GetOrCreateFolder(_ context.Context, _ string) (string, error) {
+	return "folder-id", nil
+}
+func (f fakeGraph) MoveMessages(_ context.Context, _ []string, _ string) (int, int, error) {
+	return 0, 0, nil
+}
 
 // fakeLLM implements llmService.
 type fakeLLM struct {
@@ -98,6 +106,7 @@ func newTestServer(t *testing.T, auth authService, st *store.Store) *Server {
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
 		progress:      newProgressBus(),
+		graphAgent:    agentgraph.New(nil, fakeGraph{}),
 	}
 	s.routes()
 	return s
@@ -344,6 +353,7 @@ func newDoctorServer(t *testing.T, auth authService, gc graphService, lc llmServ
 		llm:           lc,
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
+		graphAgent:    agentgraph.New(nil, gc.(agentgraph.GraphClient)),
 	}
 	s.routes()
 	return s
@@ -534,6 +544,10 @@ func newSummaryServer(t *testing.T, auth authService, gc graphService, lc llmSer
 		store:         st,
 		pendingLogins: make(map[string]pendingLogin),
 		progress:      newProgressBus(),
+		graphAgent:    agentgraph.New(nil, gc.(agentgraph.GraphClient)),
+	}
+	if ghc != nil {
+		s.githubAgent = agentgithub.New(ghc.(agentgithub.GitHubClient))
 	}
 	s.routes()
 	return s

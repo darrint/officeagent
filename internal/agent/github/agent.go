@@ -23,9 +23,14 @@ type LLMClient interface {
 	Chat(ctx context.Context, messages []llm.Message) (string, error)
 }
 
+// GitHubClient is the interface the agent requires from the GitHub API client.
+type GitHubClient interface {
+	ListRecentPRs(ctx context.Context, since time.Time, orgs []string, username string) ([]githubclient.PullRequest, error)
+}
+
 // Agent is the GitHub service agent.
 type Agent struct {
-	client *githubclient.Client
+	client GitHubClient
 	store  *store.Store
 
 	// config populated by Configure
@@ -39,7 +44,7 @@ type Agent struct {
 
 // New creates a new GitHub Agent.
 // Call Configure to load settings from the store before using skills.
-func New(client *githubclient.Client) *Agent {
+func New(client GitHubClient) *Agent {
 	return &Agent{
 		client: client,
 		prompt: DefaultGitHubPrompt,
@@ -185,6 +190,10 @@ func (a *Agent) LookbackDays() int { return a.lookbackDays }
 
 // Prompt returns the current GitHub PR prompt.
 func (a *Agent) Prompt() string { return a.prompt }
+
+// SetClient replaces the underlying GitHub API client. Used by reinitClients
+// to hot-swap the client after a token change.
+func (a *Agent) SetClient(client GitHubClient) { a.client = client }
 
 // since computes the "updated since" cutoff time for PR queries.
 func (a *Agent) since() time.Time {

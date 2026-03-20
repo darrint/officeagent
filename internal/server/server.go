@@ -14,13 +14,16 @@ import (
 	"time"
 
 	"github.com/darrint/officeagent/internal/activitylog"
+	agentfastmail "github.com/darrint/officeagent/internal/agent/fastmail"
+	agentgithub "github.com/darrint/officeagent/internal/agent/github"
+	agentgraph "github.com/darrint/officeagent/internal/agent/graph"
+	agentntfy "github.com/darrint/officeagent/internal/agent/ntfy"
+	agentprivatebin "github.com/darrint/officeagent/internal/agent/privatebin"
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/fastmail"
 	github "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
-	"github.com/darrint/officeagent/internal/ntfy"
-	privatebinClient "github.com/darrint/officeagent/internal/privatebin"
 	"github.com/darrint/officeagent/internal/store"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
@@ -58,34 +61,10 @@ type fastmailService interface {
 	ListMessages(ctx context.Context, top int) ([]fastmail.Message, error)
 }
 
-// fastmailMoverService extends fastmailService with archive capabilities.
-type fastmailMoverService interface {
-	fastmailService
-	GetOrCreateMailbox(ctx context.Context, name string) (string, error)
-	MoveMessages(ctx context.Context, messageIDs []string, targetMailboxID string) error
-}
-
 // fastmailReadOnlyChecker is optionally implemented by the Fastmail client to
 // report whether the API token has write access.
 type fastmailReadOnlyChecker interface {
 	IsReadOnly(ctx context.Context) (bool, error)
-}
-
-// graphMoverService extends graphService with archive capabilities.
-type graphMoverService interface {
-	graphService
-	GetOrCreateFolder(ctx context.Context, name string) (string, error)
-	// MoveMessages moves messages to the given folder. Returns the number moved,
-	// the number skipped (already gone / not found), and any hard error.
-	MoveMessages(ctx context.Context, messageIDs []string, folderID string) (moved, skipped int, err error)
-}
-
-// classifyMsg is a compact message descriptor sent to the LLM for classification.
-type classifyMsg struct {
-	ID      string
-	From    string
-	Subject string
-	Preview string
 }
 
 // lowPrioMsg is a message identified as low-priority during the assessment phase.
@@ -106,15 +85,6 @@ type archiveResult struct {
 	FastmailError string `json:"fastmail_error,omitempty"`
 	GraphError    string `json:"graph_error,omitempty"`
 }
-
-// Default system prompts. Used when no custom prompt is stored.
-const (
-	defaultOverallPrompt  = ""
-	defaultEmailPrompt    = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
-	defaultCalendarPrompt = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
-	defaultGitHubPrompt   = "You are a helpful engineering assistant. Give the user a concise summary of recent GitHub pull request activity across their team. Start with the overall picture: what is being worked on, what shipped, what is under review. Then highlight anything that specifically needs the user's attention — review requests, mentions, or their own open PRs awaiting feedback. Be friendly but brief."
-	defaultFastmailPrompt = "You are a helpful personal assistant. Give the user a concise summary of their recent personal inbox. Highlight anything that needs attention or action. Be friendly but brief."
-)
 
 // buildSystemPrompt assembles the final system prompt sent to the LLM.
 // If overall is non-empty it is prepended to specific, separated by a blank
@@ -220,6 +190,14 @@ type Server struct {
 	store    *store.Store
 	alog     *activitylog.Logger // may be nil; writes are no-ops via NewDiscard
 
+	// agents — wired in New(); used for all production code paths.
+	// The legacy interface fields above are retained for test compatibility.
+	graphAgent      *agentgraph.Agent
+	githubAgent     *agentgithub.Agent
+	fastmailAgent   *agentfastmail.Agent
+	ntfyAgent       *agentntfy.Agent
+	privatebinAgent *agentprivatebin.Agent
+
 	clientMu      sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingLogins map[string]pendingLogin // state -> pending
@@ -241,13 +219,6 @@ func (s *Server) getLLM() llmService {
 	s.clientMu.RLock()
 	defer s.clientMu.RUnlock()
 	return s.llm
-}
-
-// getGHClient returns the current GitHub client, safe for concurrent use.
-func (s *Server) getGHClient() githubService {
-	s.clientMu.RLock()
-	defer s.clientMu.RUnlock()
-	return s.ghClient
 }
 
 // getFMClient returns the current Fastmail client, safe for concurrent use.
@@ -310,17 +281,53 @@ func (s *Server) reinitClients() {
 	fmTok := s.effectiveFastmailToken()
 	s.clientMu.Lock()
 	defer s.clientMu.Unlock()
+
+	var newGHClient *github.Client
+	var newFMClient *fastmail.Client
+
 	if ghTok != "" {
-		s.llm = llm.NewClient(ghTok, s.cfg.LLMModel)
-		s.ghClient = github.NewClient(ghTok)
+		newLLM := llm.NewClient(ghTok, s.cfg.LLMModel)
+		s.llm = newLLM
+		newGHClient = github.NewClient(ghTok)
+		s.ghClient = newGHClient
 	} else {
 		s.llm = nil
 		s.ghClient = nil
 	}
 	if fmTok != "" {
-		s.fmClient = fastmail.NewClient(fmTok)
+		newFMClient = fastmail.NewClient(fmTok)
+		s.fmClient = newFMClient
 	} else {
 		s.fmClient = nil
+	}
+
+	// Propagate new clients to agents and reconfigure from store.
+	if s.githubAgent != nil {
+		s.githubAgent.SetClient(newGHClient)
+		if err := s.githubAgent.Configure(s.store); err != nil {
+			log.Printf("reinitClients: github agent configure: %v", err)
+		}
+	}
+	if s.fastmailAgent != nil {
+		s.fastmailAgent.SetClient(newFMClient)
+		if err := s.fastmailAgent.Configure(s.store); err != nil {
+			log.Printf("reinitClients: fastmail agent configure: %v", err)
+		}
+	}
+	if s.graphAgent != nil {
+		if err := s.graphAgent.Configure(s.store); err != nil {
+			log.Printf("reinitClients: graph agent configure: %v", err)
+		}
+	}
+	if s.ntfyAgent != nil {
+		if err := s.ntfyAgent.Configure(s.store); err != nil {
+			log.Printf("reinitClients: ntfy agent configure: %v", err)
+		}
+	}
+	if s.privatebinAgent != nil {
+		if err := s.privatebinAgent.Configure(s.store); err != nil {
+			log.Printf("reinitClients: privatebin agent configure: %v", err)
+		}
 	}
 }
 
@@ -353,6 +360,29 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 	if fmClient != nil {
 		s.fmClient = fmClient
 	}
+
+	// Construct and configure the five service agents.
+	s.graphAgent = agentgraph.New(auth, client)
+	if err := s.graphAgent.Configure(st); err != nil {
+		log.Printf("graph agent configure: %v", err)
+	}
+	s.githubAgent = agentgithub.New(ghClient)
+	if err := s.githubAgent.Configure(st); err != nil {
+		log.Printf("github agent configure: %v", err)
+	}
+	s.fastmailAgent = agentfastmail.New(fmClient)
+	if err := s.fastmailAgent.Configure(st); err != nil {
+		log.Printf("fastmail agent configure: %v", err)
+	}
+	s.ntfyAgent = agentntfy.New()
+	if err := s.ntfyAgent.Configure(st); err != nil {
+		log.Printf("ntfy agent configure: %v", err)
+	}
+	s.privatebinAgent = agentprivatebin.New()
+	if err := s.privatebinAgent.Configure(st); err != nil {
+		log.Printf("privatebin agent configure: %v", err)
+	}
+
 	s.routes()
 	return s
 }
@@ -743,42 +773,6 @@ func lastWorkDaySince(now time.Time) time.Time {
 	return day
 }
 
-// githubSince returns the time.Time to use as the "updated since" cutoff for
-// GitHub PR queries. Reads setting.github.lookback_days from the store;
-// "0" (or unset) means auto (last work day).
-func (s *Server) githubSince() time.Time {
-	raw := s.getSetting("github.lookback_days", "0")
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		return lastWorkDaySince(time.Now())
-	}
-	return time.Now().AddDate(0, 0, -n)
-}
-
-// githubOrgs returns the list of GitHub org filters from settings.
-// Returns nil (meaning "all orgs") if the setting is empty.
-func (s *Server) githubOrgs() []string {
-	raw := strings.TrimSpace(s.getSetting("github.orgs", ""))
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	orgs := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			orgs = append(orgs, p)
-		}
-	}
-	return orgs
-}
-
-// githubUsername returns the GitHub username from settings, used to include
-// personal repo PRs alongside org-scoped results.
-func (s *Server) githubUsername() string {
-	return strings.TrimSpace(s.getSetting("github.username", ""))
-}
-
 var settingsTmpl = template.Must(template.New("settings").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -929,24 +923,34 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := settingsData{
-		OverallPrompt:         s.getPrompt("overall", defaultOverallPrompt),
-		EmailPrompt:           s.getPrompt("email", defaultEmailPrompt),
-		CalendarPrompt:        s.getPrompt("calendar", defaultCalendarPrompt),
-		GitHubPrompt:          s.getPrompt("github", defaultGitHubPrompt),
-		FastmailPrompt:        s.getPrompt("fastmail", defaultFastmailPrompt),
-		GitHubLookbackDays:    s.getSetting("github.lookback_days", "0"),
-		GitHubOrgs:            s.getSetting("github.orgs", ""),
-		GitHubUsername:        s.getSetting("github.username", ""),
-		GitHubTokenSet:        s.effectiveGitHubToken() != "",
-		FastmailTokenSet:      s.effectiveFastmailToken() != "",
-		AzureClientID:         s.effectiveAzureClientID(),
-		AzureTenantID:         s.effectiveAzureTenantID(),
-		FastmailLowPrioFolder: s.getSetting("fastmail_lowprio_folder", "Low Priority"),
-		GraphLowPrioFolder:    s.getSetting("graph_lowprio_folder", "Low Priority"),
-		NtfyTopic:             s.getSetting("ntfy_topic", ""),
-		PrivateBinURL:         s.getSetting("privatebin_url", "https://privatebin.net"),
-		Saved:                 r.URL.Query().Get("saved") == "1",
+		Saved: r.URL.Query().Get("saved") == "1",
 	}
+	if s.graphAgent != nil {
+		data.OverallPrompt = s.graphAgent.OverallPrompt()
+		data.EmailPrompt = s.graphAgent.EmailPrompt()
+		data.CalendarPrompt = s.graphAgent.CalendarPrompt()
+		data.GraphLowPrioFolder = s.graphAgent.LowPrioFolder()
+	}
+	if s.githubAgent != nil {
+		data.GitHubPrompt = s.githubAgent.Prompt()
+		data.GitHubLookbackDays = strconv.Itoa(s.githubAgent.LookbackDays())
+		data.GitHubOrgs = strings.Join(s.githubAgent.Orgs(), ", ")
+		data.GitHubUsername = s.githubAgent.Username()
+		data.GitHubTokenSet = s.githubAgent.Token() != ""
+	}
+	if s.fastmailAgent != nil {
+		data.FastmailPrompt = s.fastmailAgent.Prompt()
+		data.FastmailTokenSet = s.fastmailAgent.Token() != ""
+		data.FastmailLowPrioFolder = s.fastmailAgent.LowPrioFolder()
+	}
+	if s.ntfyAgent != nil {
+		data.NtfyTopic = s.ntfyAgent.Topic()
+	}
+	if s.privatebinAgent != nil {
+		data.PrivateBinURL = s.privatebinAgent.InstanceURL()
+	}
+	data.AzureClientID = s.effectiveAzureClientID()
+	data.AzureTenantID = s.effectiveAzureTenantID()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := settingsTmpl.Execute(w, data); err != nil {
 		log.Printf("settings template: %v", err)
@@ -1010,15 +1014,12 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			if err := s.store.Set("setting.github_token", githubToken); err != nil {
 				log.Printf("store set setting.github_token: %v", err)
 			}
-			// Rebuild LLM / GitHub clients immediately with the new token.
-			s.reinitClients()
 		}
 		// Same pattern for Fastmail token.
 		if fastmailToken != "" {
 			if err := s.store.Set("setting.fastmail_token", fastmailToken); err != nil {
 				log.Printf("store set setting.fastmail_token: %v", err)
 			}
-			s.reinitClients()
 		}
 		if azureClientID != "" {
 			if err := s.store.Set("setting.azure_client_id", azureClientID); err != nil {
@@ -1048,6 +1049,8 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.Set("setting.privatebin_url", privateBinURL); err != nil {
 			log.Printf("store set setting.privatebin_url: %v", err)
 		}
+		// Rebuild clients and reconfigure agents with all updated settings.
+		s.reinitClients()
 	}
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 }
@@ -1108,73 +1111,6 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// parseLLMIDs extracts a JSON array of string IDs from an LLM reply.
-// It strips markdown code fences before parsing.
-func parseLLMIDs(reply string) []string {
-	s := strings.TrimSpace(reply)
-	// Strip markdown code fences.
-	if idx := strings.Index(s, "```"); idx >= 0 {
-		s = s[idx+3:]
-		if nl := strings.Index(s, "\n"); nl >= 0 {
-			s = s[nl+1:]
-		}
-		if end := strings.LastIndex(s, "```"); end >= 0 {
-			s = s[:end]
-		}
-	}
-	s = strings.TrimSpace(s)
-	// Find JSON array bounds.
-	start := strings.Index(s, "[")
-	end := strings.LastIndex(s, "]")
-	if start < 0 || end <= start {
-		return nil
-	}
-	var ids []string
-	if err := json.Unmarshal([]byte(s[start:end+1]), &ids); err != nil {
-		log.Printf("parseLLMIDs: unmarshal error: %v (input: %q)", err, s[start:end+1])
-		return nil
-	}
-	return ids
-}
-
-// filterToKnownIDs returns only the IDs from proposed that appear in known.
-// This prevents the LLM from returning hallucinated IDs.
-func filterToKnownIDs(proposed []string, known []classifyMsg) []string {
-	set := make(map[string]struct{}, len(known))
-	for _, m := range known {
-		set[m.ID] = struct{}{}
-	}
-	var out []string
-	for _, id := range proposed {
-		if _, ok := set[id]; ok {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-// classifyLowPriority asks the LLM to identify low-priority messages from msgs.
-// Returns the IDs the LLM identified as low priority (unvalidated — caller must
-// call filterToKnownIDs before using them).
-func classifyLowPriority(ctx context.Context, msgs []classifyMsg, llmC llmService) ([]string, error) {
-	if len(msgs) == 0 {
-		return nil, nil
-	}
-	var sb strings.Builder
-	for _, m := range msgs {
-		fmt.Fprintf(&sb, "ID: %s\nFrom: %s\nSubject: %s\nPreview: %s\n\n", m.ID, m.From, m.Subject, m.Preview)
-	}
-	systemPrompt := "You are an email assistant. Identify which of the following emails are low priority: newsletters, marketing, automated notifications, promotional offers, social media digests, and other non-actionable bulk messages. Return ONLY a JSON array of IDs for the low-priority messages. No explanation, no markdown, just the JSON array. If none are low priority return []."
-	reply, err := llmC.Chat(ctx, []llm.Message{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: sb.String()},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("LLM classify: %w", err)
-	}
-	return parseLLMIDs(reply), nil
-}
-
 // cachedLowPrioIDs returns the IDs of low-priority messages for the given
 // source ("graph" or "fastmail") from the last cached report. Returns nil (not
 // an empty slice) when no cached report exists, signalling the caller to fall
@@ -1201,47 +1137,18 @@ func (s *Server) cachedLowPrioIDs(_ context.Context, source string) ([]string, s
 // only when no cached IDs are available.
 // Returns count moved and error string (empty on success).
 func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (int, string) {
-	fmC, ok := s.getFMClient().(fastmailMoverService)
-	if !ok {
-		return 0, "" // Fastmail not configured or client doesn't support moving
+	if s.fastmailAgent == nil {
+		return 0, ""
 	}
-	folderName := s.getSetting("fastmail_lowprio_folder", "Low Priority")
-
-	// Use cached IDs from the last briefing generation if available.
 	ids, errStr := s.cachedLowPrioIDs(ctx, "fastmail")
 	if errStr != "" {
 		return 0, errStr
 	}
-
-	// Fallback: re-classify live if no cached IDs.
-	if ids == nil {
-		rawMsgs, err := fmC.ListMessages(ctx, 30)
-		if err != nil {
-			return 0, fmt.Sprintf("list messages: %v", err)
-		}
-		msgs := make([]classifyMsg, len(rawMsgs))
-		for i, m := range rawMsgs {
-			msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
-		}
-		proposed, err := classifyLowPriority(ctx, msgs, llmC)
-		if err != nil {
-			return 0, err.Error()
-		}
-		ids = filterToKnownIDs(proposed, msgs)
-	}
-
-	if len(ids) == 0 {
-		return 0, ""
-	}
-
-	mailboxID, err := fmC.GetOrCreateMailbox(ctx, folderName)
+	n, err := s.fastmailAgent.ArchiveLowPrio(ctx, llmC, ids)
 	if err != nil {
-		return 0, fmt.Sprintf("get/create mailbox: %v", err)
+		return n, err.Error()
 	}
-	if err := fmC.MoveMessages(ctx, ids, mailboxID); err != nil {
-		return 0, fmt.Sprintf("move messages: %v", err)
-	}
-	return len(ids), ""
+	return n, ""
 }
 
 // archiveGraphLowPrio moves low-priority Graph (Office 365) messages using IDs
@@ -1250,47 +1157,16 @@ func (s *Server) archiveFastmailLowPrio(ctx context.Context, llmC llmService) (i
 // Returns count moved, count skipped (stale/not-found IDs), and error string
 // (empty on success). Partial results are returned alongside errors.
 func (s *Server) archiveGraphLowPrio(ctx context.Context, llmC llmService) (moved, skipped int, errStr string) {
-	gC, ok := s.client.(graphMoverService)
-	if !ok {
-		return 0, 0, "" // Graph not configured or client doesn't support moving
+	if s.graphAgent == nil {
+		return 0, 0, ""
 	}
-	folderName := s.getSetting("graph_lowprio_folder", "Low Priority")
-
-	// Use cached IDs from the last briefing generation if available.
 	ids, es := s.cachedLowPrioIDs(ctx, "graph")
 	if es != "" {
 		return 0, 0, es
 	}
-
-	// Fallback: re-classify live if no cached IDs.
-	if ids == nil {
-		rawMsgs, err := gC.ListMessages(ctx, 30)
-		if err != nil {
-			return 0, 0, fmt.Sprintf("list messages: %v", err)
-		}
-		msgs := make([]classifyMsg, len(rawMsgs))
-		for i, m := range rawMsgs {
-			msgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
-		}
-		proposed, err := classifyLowPriority(ctx, msgs, llmC)
-		if err != nil {
-			return 0, 0, err.Error()
-		}
-		ids = filterToKnownIDs(proposed, msgs)
-	}
-
-	if len(ids) == 0 {
-		return 0, 0, ""
-	}
-
-	folderID, err := gC.GetOrCreateFolder(ctx, folderName)
+	moved, skipped, err := s.graphAgent.ArchiveLowPrio(ctx, llmC, ids)
 	if err != nil {
-		return 0, 0, fmt.Sprintf("get/create folder: %v", err)
-	}
-	moved, skipped, moveErr := gC.MoveMessages(ctx, ids, folderID)
-	if moveErr != nil {
-		// Return partial counts alongside the error so the caller can report them.
-		return moved, skipped, fmt.Sprintf("move messages: %v", moveErr)
+		return moved, skipped, err.Error()
 	}
 	return moved, skipped, ""
 }
@@ -1467,7 +1343,6 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	}
 
 	llmC := s.getLLM()
-	ghC := s.getGHClient()
 	if llmC == nil {
 		return nil, fmt.Errorf("LLM not configured")
 	}
@@ -1476,210 +1351,59 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	var emailSection sectionData
 	var graphLowPrios []lowPrioMsg
 	{
+		if s.graphAgent == nil {
+			emit("email:skip", "Graph not configured, skipping work email.")
+		} else {
 		emit("email:fetch", "Fetching work email...")
-		msgs, err := s.client.ListMessages(ctx, 20)
+		summary, agentLowPrios, err := s.graphAgent.EmailSummary(ctx, llmC, s.feedbackContext("email"))
 		if err != nil {
-			emit("email:error", fmt.Sprintf("Email fetch failed: %v", err))
+			emit("email:error", fmt.Sprintf("Email fetch/summary failed: %v", err))
 			emailSection = sectionData{Error: fmt.Sprintf("Failed to fetch email: %v", err)}
 		} else {
-			emit("email:llm", fmt.Sprintf("Summarising %d email(s) with AI...", len(msgs)))
-
-			// Build classifyMsg list from raw messages for low-prio classification.
-			classifyMsgs := make([]classifyMsg, len(msgs))
-			for i, m := range msgs {
-				classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
+			emit("email:classify", "Classifying low-priority work email...")
+			for _, m := range agentLowPrios {
+				graphLowPrios = append(graphLowPrios, lowPrioMsg{
+					ID: m.ID, Source: "graph", From: m.From, Subject: m.Subject, ReceivedAt: m.ReceivedAt,
+				})
 			}
-
-			var sb strings.Builder
-			if len(msgs) == 0 {
-				sb.WriteString("No recent messages.")
-			} else {
-				for _, m := range msgs {
-					fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
-						m.From,
-						m.Subject,
-						m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-						m.BodyPreview,
-					)
-				}
-			}
-			reply, err := llmC.Chat(ctx, []llm.Message{
-				{
-					Role: "system",
-					Content: buildSystemPrompt(
-						s.getPrompt("overall", defaultOverallPrompt),
-						s.getPrompt("email", defaultEmailPrompt)+s.feedbackContext("email"),
-					),
-				},
-				{Role: "user", Content: "Here are my recent emails:\n\n" + sb.String()},
-			})
-			if err != nil {
-				emit("email:error", fmt.Sprintf("Email AI summary failed: %v", err))
-				emailSection = sectionData{Error: fmt.Sprintf("LLM error (email): %v", err)}
-			} else {
-				// Classify low-priority messages using the already-fetched list.
-				emit("email:classify", "Classifying low-priority work email...")
-				proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
-				if classErr != nil {
-					log.Printf("GenerateBriefing: classify graph low-prio: %v", classErr)
-				} else {
-					ids := filterToKnownIDs(proposed, classifyMsgs)
-					idSet := make(map[string]struct{}, len(ids))
-					for _, id := range ids {
-						idSet[id] = struct{}{}
-					}
-					for _, m := range msgs {
-						if _, ok := idSet[m.ID]; ok {
-							graphLowPrios = append(graphLowPrios, lowPrioMsg{
-								ID:         m.ID,
-								Source:     "graph",
-								From:       m.From,
-								Subject:    m.Subject,
-								ReceivedAt: m.ReceivedAt,
-							})
-						}
-					}
-				}
-				emit("email:done", "Work email summary ready.")
-				emailSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
-			}
+			emit("email:done", "Work email summary ready.")
+			emailSection = sectionData{HTML: renderMarkdown(summary), Raw: summary}
+		}
 		}
 	}
 
 	// Step 2: Graph calendar
 	var calSection sectionData
 	{
+		if s.graphAgent == nil {
+			emit("calendar:skip", "Graph not configured, skipping calendar.")
+		} else {
 		emit("calendar:fetch", "Fetching calendar events...")
-		events, err := s.client.ListEvents(ctx, 20)
+		summary, err := s.graphAgent.CalendarSummary(ctx, llmC, s.feedbackContext("calendar"))
 		if err != nil {
-			emit("calendar:error", fmt.Sprintf("Calendar fetch failed: %v", err))
+			emit("calendar:error", fmt.Sprintf("Calendar fetch/summary failed: %v", err))
 			calSection = sectionData{Error: fmt.Sprintf("Failed to fetch calendar: %v", err)}
 		} else {
-			emit("calendar:llm", fmt.Sprintf("Summarising %d event(s) with AI...", len(events)))
-			var sb strings.Builder
-			if len(events) == 0 {
-				sb.WriteString("No upcoming events.")
-			} else {
-				for _, e := range events {
-					fmt.Fprintf(&sb, "- %s: %s to %s\n",
-						e.Subject,
-						e.Start.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-						e.End.In(easternLoc).Format("3:04 PM MST"),
-					)
-				}
-			}
-			reply, err := llmC.Chat(ctx, []llm.Message{
-				{
-					Role: "system",
-					Content: buildSystemPrompt(
-						s.getPrompt("overall", defaultOverallPrompt),
-						s.getPrompt("calendar", defaultCalendarPrompt)+s.feedbackContext("calendar"),
-					),
-				},
-				{Role: "user", Content: "Here are my upcoming calendar events:\n\n" + sb.String()},
-			})
-			if err != nil {
-				emit("calendar:error", fmt.Sprintf("Calendar AI summary failed: %v", err))
-				calSection = sectionData{Error: fmt.Sprintf("LLM error (calendar): %v", err)}
-			} else {
-				emit("calendar:done", "Calendar summary ready.")
-				calSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
-			}
+			emit("calendar:done", "Calendar summary ready.")
+			calSection = sectionData{HTML: renderMarkdown(summary), Raw: summary}
+		}
 		}
 	}
 
 	// Step 3: GitHub PRs
 	var ghSection sectionData
 	{
-		if ghC == nil {
+		if s.githubAgent == nil {
 			emit("github:skip", "GitHub not configured, skipping.")
 		} else {
 			emit("github:fetch", "Fetching GitHub PRs...")
-			prs, err := ghC.ListRecentPRs(ctx, s.githubSince(), s.githubOrgs(), s.githubUsername())
+			summary, err := s.githubAgent.PRSummary(ctx, llmC, s.feedbackContext("github"))
 			if err != nil {
-				emit("github:error", fmt.Sprintf("GitHub fetch failed: %v", err))
+				emit("github:error", fmt.Sprintf("GitHub fetch/summary failed: %v", err))
 				ghSection = sectionData{Error: fmt.Sprintf("Failed to fetch GitHub PRs: %v", err)}
 			} else {
-				emit("github:llm", fmt.Sprintf("Summarising %d PR(s) with AI...", len(prs)))
-				var sb strings.Builder
-				if len(prs) == 0 {
-					sb.WriteString("No recent pull request activity.")
-				} else {
-					cutoff24h := time.Now().UTC().Add(-24 * time.Hour)
-
-					// Partition into newly opened (created in last 24h) vs active (older).
-					var newPRs, activePRs []github.PullRequest
-					for _, pr := range prs {
-						if pr.CreatedAt.After(cutoff24h) {
-							newPRs = append(newPRs, pr)
-						} else {
-							activePRs = append(activePRs, pr)
-						}
-					}
-
-					writePR := func(pr github.PullRequest) {
-						status := pr.State
-						if pr.MergedAt != nil {
-							status = "merged"
-						}
-						fmt.Fprintf(&sb, "- [%s#%d](%s) %s (%s) by %s — updated %s\n",
-							pr.Repo, pr.Number, pr.HTMLURL, pr.Title,
-							status, pr.Author,
-							pr.UpdatedAt.In(easternLoc).Format("Mon Jan 2 15:04"),
-						)
-						for _, r := range pr.Reviews {
-							fmt.Fprintf(&sb, "  - review by %s: %s (%s)\n",
-								r.Author, r.State,
-								r.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
-							)
-						}
-						for _, cm := range pr.Comments {
-							fmt.Fprintf(&sb, "  - comment by %s (%s): %s\n",
-								cm.Author,
-								cm.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
-								cm.Body,
-							)
-						}
-						for _, co := range pr.RecentCommits {
-							fmt.Fprintf(&sb, "  - commit %s by %s (%s): %s\n",
-								co.SHA, co.Author,
-								co.CreatedAt.In(easternLoc).Format("Jan 2 15:04"),
-								co.Message,
-							)
-						}
-					}
-
-					if len(newPRs) > 0 {
-						sb.WriteString("### New PRs opened today\n")
-						for _, pr := range newPRs {
-							writePR(pr)
-						}
-						sb.WriteString("\n")
-					}
-					if len(activePRs) > 0 {
-						sb.WriteString("### Active PRs with recent updates\n")
-						for _, pr := range activePRs {
-							writePR(pr)
-						}
-					}
-				}
-				reply, err := llmC.Chat(ctx, []llm.Message{
-					{
-						Role: "system",
-						Content: buildSystemPrompt(
-							s.getPrompt("overall", defaultOverallPrompt),
-							s.getPrompt("github", defaultGitHubPrompt)+s.feedbackContext("github"),
-						),
-					},
-					{Role: "user", Content: "Here is my recent GitHub pull request activity:\n\n" + sb.String()},
-				})
-				if err != nil {
-					emit("github:error", fmt.Sprintf("GitHub AI summary failed: %v", err))
-					ghSection = sectionData{Error: fmt.Sprintf("LLM error (github): %v", err)}
-				} else {
-					emit("github:done", "GitHub PR summary ready.")
-					ghSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
-				}
+				emit("github:done", "GitHub PR summary ready.")
+				ghSection = sectionData{HTML: renderMarkdown(summary), Raw: summary}
 			}
 		}
 	}
@@ -1688,78 +1412,28 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	var fmSection sectionData
 	var fmLowPrios []lowPrioMsg
 	{
-		fmC := s.getFMClient()
-		if fmC == nil {
+		if s.fastmailAgent == nil {
 			emit("fastmail:skip", "Fastmail not configured, skipping.")
 		} else {
-			emit("fastmail:fetch", "Fetching Fastmail inbox...")
-			msgs, err := fmC.ListMessages(ctx, 20)
-			if err != nil {
-				emit("fastmail:error", fmt.Sprintf("Fastmail fetch failed: %v", err))
-				fmSection = sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}
+		emit("fastmail:fetch", "Fetching Fastmail inbox...")
+		summary, agentLowPrios, err := s.fastmailAgent.EmailSummary(ctx, llmC, s.feedbackContext("fastmail"))
+		if err != nil {
+			if err.Error() == "fastmail not configured" {
+				emit("fastmail:skip", "Fastmail not configured, skipping.")
 			} else {
-				emit("fastmail:llm", fmt.Sprintf("Summarising %d personal email(s) with AI...", len(msgs)))
-
-				// Build classifyMsg list for low-prio classification.
-				classifyMsgs := make([]classifyMsg, len(msgs))
-				for i, m := range msgs {
-					classifyMsgs[i] = classifyMsg{ID: m.ID, From: m.From, Subject: m.Subject, Preview: m.BodyPreview}
-				}
-
-				var sb strings.Builder
-				if len(msgs) == 0 {
-					sb.WriteString("No recent messages.")
-				} else {
-					for _, m := range msgs {
-						fmt.Fprintf(&sb, "- From: %s | Subject: %s | Received: %s\n  Preview: %s\n",
-							m.From,
-							m.Subject,
-							m.ReceivedAt.In(easternLoc).Format("Mon Jan 2 3:04 PM MST"),
-							m.BodyPreview,
-						)
-					}
-				}
-				reply, err := llmC.Chat(ctx, []llm.Message{
-					{
-						Role: "system",
-						Content: buildSystemPrompt(
-							s.getPrompt("overall", defaultOverallPrompt),
-							s.getPrompt("fastmail", defaultFastmailPrompt)+s.feedbackContext("fastmail"),
-						),
-					},
-					{Role: "user", Content: "Here are my recent personal emails:\n\n" + sb.String()},
-				})
-				if err != nil {
-					emit("fastmail:error", fmt.Sprintf("Fastmail AI summary failed: %v", err))
-					fmSection = sectionData{Error: fmt.Sprintf("LLM error (fastmail): %v", err)}
-				} else {
-					// Classify low-priority messages using the already-fetched list.
-					emit("fastmail:classify", "Classifying low-priority personal email...")
-					proposed, classErr := classifyLowPriority(ctx, classifyMsgs, llmC)
-					if classErr != nil {
-						log.Printf("GenerateBriefing: classify fastmail low-prio: %v", classErr)
-					} else {
-						ids := filterToKnownIDs(proposed, classifyMsgs)
-						idSet := make(map[string]struct{}, len(ids))
-						for _, id := range ids {
-							idSet[id] = struct{}{}
-						}
-						for _, m := range msgs {
-							if _, ok := idSet[m.ID]; ok {
-								fmLowPrios = append(fmLowPrios, lowPrioMsg{
-									ID:         m.ID,
-									Source:     "fastmail",
-									From:       m.From,
-									Subject:    m.Subject,
-									ReceivedAt: m.ReceivedAt,
-								})
-							}
-						}
-					}
-					emit("fastmail:done", "Personal email summary ready.")
-					fmSection = sectionData{HTML: renderMarkdown(reply), Raw: reply}
-				}
+				emit("fastmail:error", fmt.Sprintf("Fastmail fetch/summary failed: %v", err))
+				fmSection = sectionData{Error: fmt.Sprintf("Failed to fetch Fastmail: %v", err)}
 			}
+		} else {
+			emit("fastmail:classify", "Classifying low-priority personal email...")
+			for _, m := range agentLowPrios {
+				fmLowPrios = append(fmLowPrios, lowPrioMsg{
+					ID: m.ID, Source: "fastmail", From: m.From, Subject: m.Subject, ReceivedAt: m.ReceivedAt,
+				})
+			}
+			emit("fastmail:done", "Personal email summary ready.")
+			fmSection = sectionData{HTML: renderMarkdown(summary), Raw: summary}
+		}
 		}
 	}
 
@@ -1779,16 +1453,13 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		log.Printf("save last report: %v", err)
 	}
 
-	// Post briefing to PrivateBin if a URL is configured.
-		pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "https://privatebin.net"))
-	log.Printf("GenerateBriefing: privatebin_url=%q", pbURL)
-	if pbURL != "" {
+	// Post briefing to PrivateBin if configured.
+	if s.privatebinAgent != nil && s.privatebinAgent.InstanceURL() != "" {
 		emit("paste", "Posting briefing to PrivateBin…")
-		pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
+		pasteURL, pasteErr := s.privatebinAgent.PostBriefing(ctx, briefingMarkdown(rep))
 		if pasteErr != nil {
 			log.Printf("GenerateBriefing: PrivateBin upload: %v", pasteErr)
 		} else {
-			log.Printf("GenerateBriefing: PrivateBin paste URL: %s", pasteURL)
 			rep.BriefingPasteURL = pasteURL
 			if err := s.saveLastReport(rep); err != nil {
 				log.Printf("save last report (with PrivateBin URL): %v", err)
@@ -1826,8 +1497,7 @@ func briefingMarkdown(rep *cachedReport) []byte {
 // If the cached report has no PrivateBin paste URL yet, it attempts to post one
 // now so the notification includes a tap-to-open link.
 func (s *Server) sendNtfyReport(ctx context.Context) error {
-	topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
-	if topic == "" {
+	if s.ntfyAgent == nil || s.ntfyAgent.Topic() == "" {
 		return fmt.Errorf("ntfy topic not configured")
 	}
 	rep, err := s.loadLastReport()
@@ -1839,20 +1509,14 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	}
 
 	// If no PrivateBin paste exists yet for this report, try to create one now.
-	log.Printf("sendNtfyReport: BriefingPasteURL=%q", rep.BriefingPasteURL)
-	if rep.BriefingPasteURL == "" {
-	pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "https://privatebin.net"))
-		log.Printf("sendNtfyReport: privatebin_url=%q", pbURL)
-		if pbURL != "" {
-			pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
-			if pasteErr != nil {
-				log.Printf("sendNtfyReport: PrivateBin upload: %v", pasteErr)
-			} else {
-				log.Printf("sendNtfyReport: PrivateBin paste URL: %s", pasteURL)
-				rep.BriefingPasteURL = pasteURL
-				if err := s.saveLastReport(rep); err != nil {
-					log.Printf("sendNtfyReport: save report with paste URL: %v", err)
-				}
+	if rep.BriefingPasteURL == "" && s.privatebinAgent != nil && s.privatebinAgent.InstanceURL() != "" {
+		pasteURL, pasteErr := s.privatebinAgent.PostBriefing(ctx, briefingMarkdown(rep))
+		if pasteErr != nil {
+			log.Printf("sendNtfyReport: PrivateBin upload: %v", pasteErr)
+		} else {
+			rep.BriefingPasteURL = pasteURL
+			if err := s.saveLastReport(rep); err != nil {
+				log.Printf("sendNtfyReport: save report with paste URL: %v", err)
 			}
 		}
 	}
@@ -1862,11 +1526,10 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 
 	// Use the PrivateBin paste URL so tapping opens the briefing directly.
 	clickURL := rep.BriefingPasteURL
-	println(rep.BriefingPasteURL)
 
 	// Short body — always just the prompt to tap; full content is in the paste.
 	body := "Tap to open your morning briefing."
-	return ntfy.Send(ctx, topic, title, body, clickURL)
+	return s.ntfyAgent.Send(ctx, title, body, clickURL)
 }
 
 // StartScheduler launches a background goroutine that wakes at 7:00 AM local

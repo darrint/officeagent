@@ -27,8 +27,11 @@ type LLMClient interface {
 	Chat(ctx context.Context, messages []llm.Message) (string, error)
 }
 
-// graphMover extends the graph.Client with archive capabilities.
-type graphMover interface {
+// GraphClient is the interface the agent requires from the Graph API client.
+// It covers basic read operations plus optional archive capabilities.
+// GetOrCreateFolder and MoveMessages are used only by ArchiveLowPrio; if the
+// underlying client does not implement them ArchiveLowPrio returns (0,0,nil).
+type GraphClient interface {
 	ListMessages(ctx context.Context, top int) ([]graphclient.Message, error)
 	ListEvents(ctx context.Context, top int) ([]graphclient.Event, error)
 	GetOrCreateFolder(ctx context.Context, name string) (string, error)
@@ -55,7 +58,7 @@ type LowPrioMsg struct {
 // Agent is the Microsoft Graph service agent.
 type Agent struct {
 	auth   *graphclient.Auth
-	client *graphclient.Client
+	client GraphClient
 	store  *store.Store
 
 	// config populated by Configure
@@ -67,7 +70,7 @@ type Agent struct {
 
 // New creates a new Graph Agent with the given auth and client.
 // Call Configure to load settings from the store before using skills.
-func New(auth *graphclient.Auth, client *graphclient.Client) *Agent {
+func New(auth *graphclient.Auth, client GraphClient) *Agent {
 	return &Agent{
 		auth:           auth,
 		client:         client,
@@ -132,6 +135,9 @@ func (a *Agent) CheckCalendar(ctx context.Context) agent.CheckResult {
 // The raw markdown string and the low-priority list are returned so the server
 // can cache them without depending on this package's internal types.
 func (a *Agent) EmailSummary(ctx context.Context, llmC LLMClient, feedbackCtx string) (summary string, lowPrios []LowPrioMsg, err error) {
+	if a.client == nil {
+		return "", nil, fmt.Errorf("graph not configured")
+	}
 	msgs, err := a.client.ListMessages(ctx, 20)
 	if err != nil {
 		return "", nil, fmt.Errorf("list messages: %w", err)
@@ -189,6 +195,9 @@ func (a *Agent) EmailSummary(ctx context.Context, llmC LLMClient, feedbackCtx st
 // CalendarSummary fetches the user's upcoming calendar events and returns an
 // LLM-generated markdown summary.
 func (a *Agent) CalendarSummary(ctx context.Context, llmC LLMClient, feedbackCtx string) (string, error) {
+	if a.client == nil {
+		return "", fmt.Errorf("graph not configured")
+	}
 	events, err := a.client.ListEvents(ctx, 20)
 	if err != nil {
 		return "", fmt.Errorf("list events: %w", err)
@@ -223,15 +232,14 @@ func (a *Agent) CalendarSummary(ctx context.Context, llmC LLMClient, feedbackCtx
 // recent briefing run; pass nil to trigger a live LLM re-classification.
 // Returns the number of messages moved and skipped.
 func (a *Agent) ArchiveLowPrio(ctx context.Context, llmC LLMClient, cachedIDs []string) (moved, skipped int, err error) {
-	mover, ok := any(a.client).(graphMover)
-	if !ok {
-		return 0, 0, nil // client doesn't support moving
+	if a.client == nil {
+		return 0, 0, nil
 	}
 
 	ids := cachedIDs
 	if ids == nil {
 		// No cached IDs — re-classify live.
-		rawMsgs, listErr := mover.ListMessages(ctx, 30)
+		rawMsgs, listErr := a.client.ListMessages(ctx, 30)
 		if listErr != nil {
 			return 0, 0, fmt.Errorf("list messages: %w", listErr)
 		}
@@ -250,11 +258,11 @@ func (a *Agent) ArchiveLowPrio(ctx context.Context, llmC LLMClient, cachedIDs []
 		return 0, 0, nil
 	}
 
-	folderID, err := mover.GetOrCreateFolder(ctx, a.lowPrioFolder)
+	folderID, err := a.client.GetOrCreateFolder(ctx, a.lowPrioFolder)
 	if err != nil {
 		return 0, 0, fmt.Errorf("get/create folder: %w", err)
 	}
-	moved, skipped, err = mover.MoveMessages(ctx, ids, folderID)
+	moved, skipped, err = a.client.MoveMessages(ctx, ids, folderID)
 	if err != nil {
 		return moved, skipped, fmt.Errorf("move messages: %w", err)
 	}

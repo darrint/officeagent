@@ -221,6 +221,10 @@ func (a *Agent) ArchiveLowPrio(ctx context.Context, llmC LLMClient, cachedIDs []
 	return len(ids), nil
 }
 
+// SetClient replaces the underlying Fastmail API client. Used by reinitClients
+// when a new token is saved via the Settings page.
+func (a *Agent) SetClient(client *fastmailclient.Client) { a.client = client }
+
 // Token returns the configured Fastmail API token.
 func (a *Agent) Token() string { return a.token }
 
