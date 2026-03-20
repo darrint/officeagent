@@ -1782,7 +1782,7 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	// Post briefing to PrivateBin if a URL is configured.
 	if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
 		emit("paste", "Posting briefing to PrivateBin…")
-		pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingHTML(rep))
+		pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
 		if pasteErr != nil {
 			log.Printf("GenerateBriefing: PrivateBin upload: %v", pasteErr)
 		} else {
@@ -1797,52 +1797,25 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	return rep, nil
 }
 
-// briefingHTML formats a cachedReport as a self-contained HTML document
-// suitable for posting to PrivateBin. Markdown sections are rendered to HTML.
-// Sections with errors are omitted.
-func briefingHTML(rep *cachedReport) []byte {
+// briefingMarkdown formats a cachedReport as a Markdown document suitable for
+// posting to PrivateBin. Sections with errors are omitted.
+func briefingMarkdown(rep *cachedReport) []byte {
 	var sb strings.Builder
 	date := rep.GeneratedAt.In(easternLoc).Format("2006-01-02")
-	sb.WriteString("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
-	sb.WriteString("<meta charset=\"utf-8\">\n")
-	fmt.Fprintf(&sb, "<title>7 AM Office Summary – %s</title>\n", date)
-	sb.WriteString("<style>")
-	sb.WriteString("body{font-family:sans-serif;max-width:800px;margin:2em auto;line-height:1.6}")
-	sb.WriteString("h1,h2,h3{color:#222}")
-	sb.WriteString("table{border-collapse:collapse;width:100%}")
-	sb.WriteString("th,td{border:1px solid #ccc;padding:6px 12px;text-align:left}")
-	sb.WriteString("tr:nth-child(even){background:#f9f9f9}")
-	sb.WriteString("code{background:#f4f4f4;padding:2px 4px;border-radius:3px}")
-	sb.WriteString("blockquote{border-left:4px solid #ccc;margin:0;padding-left:1em;color:#555}")
-	sb.WriteString("</style>\n")
-	sb.WriteString("</head>\n<body>\n")
-	fmt.Fprintf(&sb, "<h1>7 AM Office Summary &#8211; %s</h1>\n", date)
+	fmt.Fprintf(&sb, "# 7 AM Office Summary – %s\n\n", date)
 	if rep.EmailRaw != "" {
-		fmt.Fprintf(&sb, "<h2>Work Email</h2>\n%s\n", markdownToHTML(rep.EmailRaw))
+		fmt.Fprintf(&sb, "## Work Email\n\n%s\n\n", rep.EmailRaw)
 	}
 	if rep.CalendarRaw != "" {
-		fmt.Fprintf(&sb, "<h2>Calendar</h2>\n%s\n", markdownToHTML(rep.CalendarRaw))
+		fmt.Fprintf(&sb, "## Calendar\n\n%s\n\n", rep.CalendarRaw)
 	}
 	if rep.GitHubRaw != "" {
-		fmt.Fprintf(&sb, "<h2>GitHub PRs</h2>\n%s\n", markdownToHTML(rep.GitHubRaw))
+		fmt.Fprintf(&sb, "## GitHub PRs\n\n%s\n\n", rep.GitHubRaw)
 	}
 	if rep.FastmailRaw != "" {
-		fmt.Fprintf(&sb, "<h2>Personal Email</h2>\n%s\n", markdownToHTML(rep.FastmailRaw))
+		fmt.Fprintf(&sb, "## Personal Email\n\n%s\n\n", rep.FastmailRaw)
 	}
-	sb.WriteString("</body>\n</html>\n")
 	return []byte(sb.String())
-}
-
-// markdownToHTML converts a Markdown string to an HTML fragment using goldmark.
-// On error it falls back to HTML-escaped plain text wrapped in a <pre>.
-func markdownToHTML(md string) string {
-	var buf bytes.Buffer
-	if err := mdRenderer.Convert([]byte(md), &buf); err != nil {
-		// Fallback: escape and wrap in <pre> so content is still readable.
-		r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
-		return "<pre>" + r.Replace(md) + "</pre>"
-	}
-	return buf.String()
 }
 
 // sendNtfyReport loads the last cached report and sends it to ntfy.
@@ -1865,7 +1838,7 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	// If no PrivateBin paste exists yet for this report, try to create one now.
 	if rep.BriefingPasteURL == "" {
 		if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
-			pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingHTML(rep))
+			pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
 			if pasteErr != nil {
 				log.Printf("sendNtfyReport: PrivateBin upload: %v", pasteErr)
 			} else {
@@ -1883,13 +1856,8 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	// Use the PrivateBin paste URL so tapping opens the briefing directly.
 	clickURL := rep.BriefingPasteURL
 
-	// Short body when a tap link is available; full markdown otherwise.
-	var body string
-	if clickURL != "" {
-		body = "Tap to open your morning briefing."
-	} else {
-		body = string(briefingHTML(rep))
-	}
+	// Short body — always just the prompt to tap; full content is in the paste.
+	body := "Tap to open your morning briefing."
 	return ntfy.Send(ctx, topic, title, body, clickURL)
 }
 
