@@ -41,7 +41,6 @@ type authService interface {
 type graphService interface {
 	ListMessages(ctx context.Context, top int) ([]graph.Message, error)
 	ListEvents(ctx context.Context, top int) ([]graph.Event, error)
-	WriteFile(ctx context.Context, path, contentType string, content []byte) (graph.DriveItem, error)
 }
 
 // llmService is the subset of llm.Client used by the server.
@@ -1408,9 +1407,7 @@ type cachedReport struct {
 	FastmailError       string       `json:"fastmail_error,omitempty"`
 	LowPrioMsgs         []lowPrioMsg `json:"low_prio_msgs,omitempty"`
 	GeneratedAt         time.Time    `json:"generated_at"`
-	BriefingWebURL      string       `json:"briefing_web_url,omitempty"`
-	BriefingDownloadURL string       `json:"briefing_download_url,omitempty"`
-	BriefingPasteURL    string       `json:"briefing_paste_url,omitempty"`
+	BriefingPasteURL string `json:"briefing_paste_url,omitempty"`
 }
 
 const reportStoreKey = "report.last"
@@ -1782,23 +1779,6 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 		log.Printf("save last report: %v", err)
 	}
 
-	// Upload briefing to OneDrive so it can be linked from ntfy notifications.
-	if s.client != nil {
-		emit("upload", "Uploading briefing to OneDrive…")
-		htmlContent := briefingHTML(rep)
-		item, uploadErr := s.client.WriteFile(ctx, "officeagent/briefing.html", "text/html", htmlContent)
-		if uploadErr != nil {
-			log.Printf("GenerateBriefing: OneDrive upload: %v", uploadErr)
-		} else {
-			rep.BriefingWebURL = item.WebURL
-			rep.BriefingDownloadURL = item.DownloadURL
-			// Persist the updated URLs.
-			if err := s.saveLastReport(rep); err != nil {
-				log.Printf("save last report (with OneDrive URLs): %v", err)
-			}
-		}
-	}
-
 	// Post briefing to PrivateBin if a URL is configured.
 	if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
 		emit("paste", "Posting briefing to PrivateBin…")
@@ -1818,7 +1798,7 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 }
 
 // briefingHTML formats a cachedReport as a self-contained HTML document
-// suitable for uploading to OneDrive. Markdown sections are rendered to HTML.
+// suitable for posting to PrivateBin. Markdown sections are rendered to HTML.
 // Sections with errors are omitted.
 func briefingHTML(rep *cachedReport) []byte {
 	var sb strings.Builder
@@ -1901,14 +1881,7 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	title := "7 AM Office Update – " + date
 
 	// Use the PrivateBin paste URL so tapping opens the briefing directly.
-	// Fall back to the OneDrive web URL, then the pre-auth download URL.
 	clickURL := rep.BriefingPasteURL
-	if clickURL == "" {
-		clickURL = rep.BriefingWebURL
-	}
-	if clickURL == "" {
-		clickURL = rep.BriefingDownloadURL
-	}
 
 	// Short body when a tap link is available; full markdown otherwise.
 	var body string
