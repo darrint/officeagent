@@ -2,6 +2,8 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+*.db-shm
+*.db-wal
 
 # beads runtime artifacts
 .beads/*.pid.lock
@@ -15,3 +17,6 @@ tokens.sh
 
 # air live-reload artifacts
 tmp/
+
+# runtime artifacts
+*.activity.ndjson
