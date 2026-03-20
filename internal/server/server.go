@@ -91,29 +91,29 @@ type classifyMsg struct {
 // lowPrioMsg is a message identified as low-priority during the assessment phase.
 // It carries enough metadata to display in the UI without a round-trip.
 type lowPrioMsg struct {
-	ID          string    `json:"id"`
-	Source      string    `json:"source"`       // "graph" or "fastmail"
-	From        string    `json:"from"`
-	Subject     string    `json:"subject"`
-	ReceivedAt  time.Time `json:"received_at"`
+	ID         string    `json:"id"`
+	Source     string    `json:"source"` // "graph" or "fastmail"
+	From       string    `json:"from"`
+	Subject    string    `json:"subject"`
+	ReceivedAt time.Time `json:"received_at"`
 }
 
 // archiveResult is returned as JSON from POST /archive-lowprio.
 type archiveResult struct {
-	FastmailMoved  int    `json:"fastmail_moved"`
-	GraphMoved     int    `json:"graph_moved"`
-	GraphSkipped   int    `json:"graph_skipped,omitempty"`
-	FastmailError  string `json:"fastmail_error,omitempty"`
-	GraphError     string `json:"graph_error,omitempty"`
+	FastmailMoved int    `json:"fastmail_moved"`
+	GraphMoved    int    `json:"graph_moved"`
+	GraphSkipped  int    `json:"graph_skipped,omitempty"`
+	FastmailError string `json:"fastmail_error,omitempty"`
+	GraphError    string `json:"graph_error,omitempty"`
 }
 
 // Default system prompts. Used when no custom prompt is stored.
 const (
-	defaultOverallPrompt   = ""
-	defaultEmailPrompt     = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
-	defaultCalendarPrompt  = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
-	defaultGitHubPrompt    = "You are a helpful engineering assistant. Give the user a concise summary of recent GitHub pull request activity across their team. Start with the overall picture: what is being worked on, what shipped, what is under review. Then highlight anything that specifically needs the user's attention — review requests, mentions, or their own open PRs awaiting feedback. Be friendly but brief."
-	defaultFastmailPrompt  = "You are a helpful personal assistant. Give the user a concise summary of their recent personal inbox. Highlight anything that needs attention or action. Be friendly but brief."
+	defaultOverallPrompt  = ""
+	defaultEmailPrompt    = "You are a helpful executive assistant. Give the user a concise summary of their recent inbox. Highlight anything urgent or requiring action. Be friendly but brief."
+	defaultCalendarPrompt = "You are a helpful executive assistant. Give the user a concise morning briefing of their upcoming calendar events. Be friendly but brief."
+	defaultGitHubPrompt   = "You are a helpful engineering assistant. Give the user a concise summary of recent GitHub pull request activity across their team. Start with the overall picture: what is being worked on, what shipped, what is under review. Then highlight anything that specifically needs the user's attention — review requests, mentions, or their own open PRs awaiting feedback. Be friendly but brief."
+	defaultFastmailPrompt = "You are a helpful personal assistant. Give the user a concise summary of their recent personal inbox. Highlight anything that needs attention or action. Be friendly but brief."
 )
 
 // buildSystemPrompt assembles the final system prompt sent to the LLM.
@@ -660,8 +660,8 @@ function sendReport() {
 </html>`))
 
 type sectionData struct {
-	HTML template.HTML
-	Raw  string // raw LLM reply, for the JSON block
+	HTML  template.HTML
+	Raw   string // raw LLM reply, for the JSON block
 	Error string
 }
 
@@ -904,23 +904,23 @@ button:hover{background:#006cbd}
 </html>`))
 
 type settingsData struct {
-	OverallPrompt          string
-	EmailPrompt            string
-	CalendarPrompt         string
-	GitHubPrompt           string
-	FastmailPrompt         string
-	GitHubLookbackDays     string
-	GitHubOrgs             string
-	GitHubUsername         string
-	GitHubTokenSet         bool   // true if a GitHub token is stored (never echo the value)
-	FastmailTokenSet       bool   // true if a Fastmail token is stored (never echo the value)
-	AzureClientID          string // not a secret — can be shown in the UI
-	AzureTenantID          string // not a secret — can be shown in the UI
-	FastmailLowPrioFolder  string
-	GraphLowPrioFolder     string
-	NtfyTopic              string // stored as setting.ntfy_topic; shown as password input
-	PrivateBinURL          string // stored as setting.privatebin_url
-	Saved                  bool
+	OverallPrompt         string
+	EmailPrompt           string
+	CalendarPrompt        string
+	GitHubPrompt          string
+	FastmailPrompt        string
+	GitHubLookbackDays    string
+	GitHubOrgs            string
+	GitHubUsername        string
+	GitHubTokenSet        bool   // true if a GitHub token is stored (never echo the value)
+	FastmailTokenSet      bool   // true if a Fastmail token is stored (never echo the value)
+	AzureClientID         string // not a secret — can be shown in the UI
+	AzureTenantID         string // not a secret — can be shown in the UI
+	FastmailLowPrioFolder string
+	GraphLowPrioFolder    string
+	NtfyTopic             string // stored as setting.ntfy_topic; shown as password input
+	PrivateBinURL         string // stored as setting.privatebin_url
+	Saved                 bool
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -1397,17 +1397,17 @@ func sectionDataFromCache(raw, errStr string) sectionData {
 // cachedReport is the serialised form of a generated morning briefing stored
 // in SQLite so that GET / can render without hitting any external APIs.
 type cachedReport struct {
-	EmailRaw            string       `json:"email_raw"`
-	CalendarRaw         string       `json:"calendar_raw"`
-	GitHubRaw           string       `json:"github_raw"`
-	FastmailRaw         string       `json:"fastmail_raw,omitempty"`
-	EmailError          string       `json:"email_error,omitempty"`
-	CalendarError       string       `json:"calendar_error,omitempty"`
-	GitHubError         string       `json:"github_error,omitempty"`
-	FastmailError       string       `json:"fastmail_error,omitempty"`
-	LowPrioMsgs         []lowPrioMsg `json:"low_prio_msgs,omitempty"`
-	GeneratedAt         time.Time    `json:"generated_at"`
-	BriefingPasteURL string `json:"briefing_paste_url,omitempty"`
+	EmailRaw         string       `json:"email_raw"`
+	CalendarRaw      string       `json:"calendar_raw"`
+	GitHubRaw        string       `json:"github_raw"`
+	FastmailRaw      string       `json:"fastmail_raw,omitempty"`
+	EmailError       string       `json:"email_error,omitempty"`
+	CalendarError    string       `json:"calendar_error,omitempty"`
+	GitHubError      string       `json:"github_error,omitempty"`
+	FastmailError    string       `json:"fastmail_error,omitempty"`
+	LowPrioMsgs      []lowPrioMsg `json:"low_prio_msgs,omitempty"`
+	GeneratedAt      time.Time    `json:"generated_at"`
+	BriefingPasteURL string       `json:"briefing_paste_url,omitempty"`
 }
 
 const reportStoreKey = "report.last"
@@ -1780,12 +1780,15 @@ func (s *Server) GenerateBriefing(ctx context.Context) (*cachedReport, error) {
 	}
 
 	// Post briefing to PrivateBin if a URL is configured.
-	if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
+	pbURL := strings.TrimSpace(s.getSetting("privatebin_url", ""))
+	log.Printf("GenerateBriefing: privatebin_url=%q", pbURL)
+	if pbURL != "" {
 		emit("paste", "Posting briefing to PrivateBin…")
 		pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
 		if pasteErr != nil {
 			log.Printf("GenerateBriefing: PrivateBin upload: %v", pasteErr)
 		} else {
+			log.Printf("GenerateBriefing: PrivateBin paste URL: %s", pasteURL)
 			rep.BriefingPasteURL = pasteURL
 			if err := s.saveLastReport(rep); err != nil {
 				log.Printf("save last report (with PrivateBin URL): %v", err)
@@ -1836,12 +1839,16 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 	}
 
 	// If no PrivateBin paste exists yet for this report, try to create one now.
+	log.Printf("sendNtfyReport: BriefingPasteURL=%q", rep.BriefingPasteURL)
 	if rep.BriefingPasteURL == "" {
-		if pbURL := strings.TrimSpace(s.getSetting("privatebin_url", "")); pbURL != "" {
+		pbURL := strings.TrimSpace(s.getSetting("privatebin_url", ""))
+		log.Printf("sendNtfyReport: privatebin_url=%q", pbURL)
+		if pbURL != "" {
 			pasteURL, pasteErr := privatebinClient.PostPaste(ctx, pbURL, briefingMarkdown(rep))
 			if pasteErr != nil {
 				log.Printf("sendNtfyReport: PrivateBin upload: %v", pasteErr)
 			} else {
+				log.Printf("sendNtfyReport: PrivateBin paste URL: %s", pasteURL)
 				rep.BriefingPasteURL = pasteURL
 				if err := s.saveLastReport(rep); err != nil {
 					log.Printf("sendNtfyReport: save report with paste URL: %v", err)
@@ -1855,6 +1862,7 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 
 	// Use the PrivateBin paste URL so tapping opens the briefing directly.
 	clickURL := rep.BriefingPasteURL
+	println(rep.BriefingPasteURL)
 
 	// Short body — always just the prompt to tap; full content is in the paste.
 	body := "Tap to open your morning briefing."
@@ -2257,12 +2265,12 @@ footer a:hover{color:#0078d4}
 </html>`))
 
 type connectData struct {
-	MSGraphAuth      bool      // authenticated with Microsoft Graph
-	MSGraphClientID  bool      // Azure client ID is configured
-	MSGraphExpiry    string    // formatted token expiry (empty if not authenticated)
-	MSGraphExpired   bool      // true if the token is past its expiry time
-	GitHubToken      bool      // GitHub token is configured
-	FastmailToken    bool      // Fastmail API token is configured
+	MSGraphAuth     bool   // authenticated with Microsoft Graph
+	MSGraphClientID bool   // Azure client ID is configured
+	MSGraphExpiry   string // formatted token expiry (empty if not authenticated)
+	MSGraphExpired  bool   // true if the token is past its expiry time
+	GitHubToken     bool   // GitHub token is configured
+	FastmailToken   bool   // Fastmail API token is configured
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
