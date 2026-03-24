@@ -2983,6 +2983,10 @@ let oldestID = 0;
     const id = parseInt(c.dataset.id, 10);
     if (id > 0 && (oldestID === 0 || id < oldestID)) oldestID = id;
   });
+  // Hide "Load earlier" if there are no cards yet.
+  if (oldestID === 0) {
+    document.getElementById('load-more').style.display = 'none';
+  }
 })();
 
 // SSE connection for new-event notifications.
@@ -3023,6 +3027,13 @@ function loadNew() {
           '<div class="card-content">' + c.summary_html + '</div>';
         feed.insertBefore(div, feed.firstChild);
       });
+      // Show "Load earlier" now that there are cards.
+      if (cards.length > 0) {
+        const btn = document.getElementById('load-more');
+        btn.style.display = '';
+        btn.disabled = false;
+        btn.textContent = 'Load earlier';
+      }
     })
     .catch(err => console.error('summarize error:', err));
 }
@@ -3030,6 +3041,7 @@ function loadNew() {
 function loadMore() {
   const btn = document.getElementById('load-more');
   btn.disabled = true;
+  btn.textContent = 'Loading…';
   const url = '/feed/cards?limit=20' + (oldestID > 0 ? '&before=' + oldestID : '');
   fetch(url)
     .then(r => r.json())
@@ -3047,9 +3059,15 @@ function loadMore() {
         feed.appendChild(div);
         if (c.id > 0 && (oldestID === 0 || c.id < oldestID)) oldestID = c.id;
       });
-      btn.disabled = cards.length === 0;
+      if (cards.length === 0) {
+        btn.textContent = 'No more cards';
+        // leave disabled
+      } else {
+        btn.textContent = 'Load earlier';
+        btn.disabled = false;
+      }
     })
-    .catch(err => { console.error('load more error:', err); btn.disabled = false; });
+    .catch(err => { console.error('load more error:', err); btn.textContent = 'Load earlier'; btn.disabled = false; });
 }
 </script>
 </body>
