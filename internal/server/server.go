@@ -662,6 +662,7 @@ function sendReport() {
     <a href="/connect">Connect</a>
     <a href="/settings">Settings</a>
     <a href="/reports">History</a>
+    <a href="/feed">Feed</a>
   </header>
   {{if .FatalError}}
   <div class="error">{{.FatalError}}</div>
@@ -2981,8 +2982,8 @@ header a{color:#0078d4;text-decoration:none;font-size:.9rem}
 <header>
   <h1>officeagent</h1>
   <a href="/">Home</a>
+  <a href="/feed">Feed</a>
   <a href="/settings">Settings</a>
-  <a href="/doctor">Doctor</a>
 </header>
 
 <div id="banner" class="banner" onclick="loadNew()">
