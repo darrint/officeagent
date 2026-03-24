@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/darrint/officeagent/internal/agent"
+	"github.com/darrint/officeagent/internal/feed"
 	graphclient "github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
@@ -36,6 +37,8 @@ type GraphClient interface {
 	ListEvents(ctx context.Context, top int) ([]graphclient.Event, error)
 	GetOrCreateFolder(ctx context.Context, name string) (string, error)
 	MoveMessages(ctx context.Context, messageIDs []string, folderID string) (moved, skipped int, err error)
+	DeltaMessages(ctx context.Context, deltaLink string) (graphclient.DeltaResult[graphclient.Message], error)
+	DeltaEvents(ctx context.Context, deltaLink string) (graphclient.DeltaResult[graphclient.Event], error)
 }
 
 // classifyMsg is a compact message descriptor for LLM classification.
@@ -267,6 +270,96 @@ func (a *Agent) ArchiveLowPrio(ctx context.Context, llmC LLMClient, cachedIDs []
 		return moved, skipped, fmt.Errorf("move messages: %w", err)
 	}
 	return moved, skipped, nil
+}
+
+// PollMail fetches new inbox messages since the last poll using the Graph delta
+// API. It updates the feed_state delta token in the store and returns new
+// feed.RawEvents. On the first call (no stored token) it establishes a baseline
+// and returns an empty slice; no cards are generated from the baseline.
+func (a *Agent) PollMail(ctx context.Context, s *store.Store) ([]feed.RawEvent, error) {
+	if a.client == nil {
+		return nil, nil
+	}
+	fs, err := s.GetFeedState("graph_mail")
+	if err != nil {
+		return nil, fmt.Errorf("get feed state: %w", err)
+	}
+
+	result, err := a.client.DeltaMessages(ctx, fs.DeltaToken)
+	if err != nil {
+		return nil, fmt.Errorf("delta messages: %w", err)
+	}
+
+	// Persist new delta link.
+	if result.DeltaLink != "" {
+		fs.DeltaToken = result.DeltaLink
+		fs.LastPoll = time.Now().UTC()
+		if err := s.SetFeedState(fs); err != nil {
+			log.Printf("graph agent: save feed state: %v", err)
+		}
+	}
+
+	// Build RawEvents from the delta items.
+	events := make([]feed.RawEvent, 0, len(result.Items))
+	for _, m := range result.Items {
+		payload, _ := json.Marshal(map[string]string{
+			"id":         m.ID,
+			"subject":    m.Subject,
+			"from":       m.From,
+			"preview":    m.BodyPreview,
+			"receivedAt": m.ReceivedAt.UTC().Format(time.RFC3339),
+		})
+		events = append(events, feed.RawEvent{
+			Source:     "graph_mail",
+			ExternalID: m.ID,
+			Payload:    string(payload),
+			OccurredAt: m.ReceivedAt,
+		})
+	}
+	return events, nil
+}
+
+// PollCalendar fetches new/changed calendar events since the last poll using
+// the Graph calendarView/delta API. Semantics mirror PollMail.
+func (a *Agent) PollCalendar(ctx context.Context, s *store.Store) ([]feed.RawEvent, error) {
+	if a.client == nil {
+		return nil, nil
+	}
+	fs, err := s.GetFeedState("graph_calendar")
+	if err != nil {
+		return nil, fmt.Errorf("get feed state: %w", err)
+	}
+
+	result, err := a.client.DeltaEvents(ctx, fs.DeltaToken)
+	if err != nil {
+		return nil, fmt.Errorf("delta events: %w", err)
+	}
+
+	if result.DeltaLink != "" {
+		fs.DeltaToken = result.DeltaLink
+		fs.LastPoll = time.Now().UTC()
+		if err := s.SetFeedState(fs); err != nil {
+			log.Printf("graph agent: save calendar feed state: %v", err)
+		}
+	}
+
+	events := make([]feed.RawEvent, 0, len(result.Items))
+	for _, e := range result.Items {
+		payload, _ := json.Marshal(map[string]string{
+			"id":       e.ID,
+			"subject":  e.Subject,
+			"start":    e.Start.UTC().Format(time.RFC3339),
+			"end":      e.End.UTC().Format(time.RFC3339),
+			"location": "", // Graph event location not in current Event type
+		})
+		events = append(events, feed.RawEvent{
+			Source:     "graph_calendar",
+			ExternalID: e.ID,
+			Payload:    string(payload),
+			OccurredAt: e.Start,
+		})
+	}
+	return events, nil
 }
 
 // LowPrioFolder returns the configured low-priority folder name.

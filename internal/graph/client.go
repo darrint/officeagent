@@ -435,3 +435,212 @@ func isGraphNotFound(err error) bool {
 	return strings.Contains(s, "404") || strings.Contains(s, "ItemNotFound") ||
 		strings.Contains(s, "ErrorItemNotFound") || strings.Contains(s, "410")
 }
+
+// DeltaResult is the result of a delta query — the new/changed items and the
+// new delta link to store for the next incremental call.
+type DeltaResult[T any] struct {
+	Items     []T
+	DeltaLink string // store this as the cursor for the next call
+}
+
+// deltaResponse is the raw JSON shape of a Graph delta response.
+type deltaResponse[T any] struct {
+	Value     []T    `json:"value"`
+	DeltaLink string `json:"@odata.deltaLink"`
+	NextLink  string `json:"@odata.nextLink"`
+}
+
+// DeltaMessages fetches new/changed inbox messages since deltaLink.
+// If deltaLink is empty, it performs an initial baseline fetch (last 20 messages)
+// and returns an empty Items slice (caller should treat this as baseline).
+// On HTTP 410 (Gone) it resets the token: returns empty Items and a new delta link.
+func (c *Client) DeltaMessages(ctx context.Context, deltaLink string) (DeltaResult[Message], error) {
+	path := "/me/mailFolders/inbox/messages/delta?$top=20&$select=id,subject,receivedDateTime,bodyPreview,from"
+	if deltaLink != "" {
+		// deltaLink is a full URL; strip the base so our get() helper works correctly.
+		path = strings.TrimPrefix(deltaLink, c.baseURL)
+		if path == deltaLink {
+			// deltaLink was a full URL with a different base (e.g. production vs test).
+			// Fall back to a raw fetch with the full URL.
+			return c.deltaMessagesFull(ctx, deltaLink)
+		}
+	}
+
+	var resp deltaResponse[graphMessage]
+	isBaseline := deltaLink == ""
+	err := c.get(ctx, path, &resp)
+	if err != nil {
+		if strings.Contains(err.Error(), "410") {
+			// Token expired — re-baseline.
+			return c.DeltaMessages(ctx, "")
+		}
+		return DeltaResult[Message]{}, err
+	}
+
+	// Follow @odata.nextLink pages to collect all results.
+	items := resp.Value
+	for resp.NextLink != "" {
+		nextPath := strings.TrimPrefix(resp.NextLink, c.baseURL)
+		var next deltaResponse[graphMessage]
+		if err := c.get(ctx, nextPath, &next); err != nil {
+			break
+		}
+		items = append(items, next.Value...)
+		resp.NextLink = next.NextLink
+		resp.DeltaLink = next.DeltaLink
+	}
+
+	msgs := make([]Message, len(items))
+	for i, m := range items {
+		msgs[i] = Message{
+			ID:          m.ID,
+			Subject:     m.Subject,
+			ReceivedAt:  m.ReceivedAt,
+			BodyPreview: m.BodyPreview,
+			From:        m.From.EmailAddress.Name + " <" + m.From.EmailAddress.Address + ">",
+		}
+	}
+	result := DeltaResult[Message]{DeltaLink: resp.DeltaLink}
+	if !isBaseline {
+		result.Items = msgs
+	}
+	return result, nil
+}
+
+// deltaMessagesFull handles deltaLink as a full external URL (test support).
+func (c *Client) deltaMessagesFull(ctx context.Context, deltaLink string) (DeltaResult[Message], error) {
+	tok, err := c.auth.Token(ctx)
+	if err != nil {
+		return DeltaResult[Message]{}, fmt.Errorf("get token: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, deltaLink, nil)
+	if err != nil {
+		return DeltaResult[Message]{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	req.Header.Set("Accept", "application/json")
+
+	httpResp, err := c.http.Do(req)
+	if err != nil {
+		return DeltaResult[Message]{}, err
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+	if httpResp.StatusCode == http.StatusGone {
+		return c.DeltaMessages(ctx, "")
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return DeltaResult[Message]{}, fmt.Errorf("graph delta %s", httpResp.Status)
+	}
+	var resp deltaResponse[graphMessage]
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		return DeltaResult[Message]{}, err
+	}
+	msgs := make([]Message, len(resp.Value))
+	for i, m := range resp.Value {
+		msgs[i] = Message{
+			ID:          m.ID,
+			Subject:     m.Subject,
+			ReceivedAt:  m.ReceivedAt,
+			BodyPreview: m.BodyPreview,
+			From:        m.From.EmailAddress.Name + " <" + m.From.EmailAddress.Address + ">",
+		}
+	}
+	return DeltaResult[Message]{Items: msgs, DeltaLink: resp.DeltaLink}, nil
+}
+
+// DeltaEvents fetches new/changed calendar events since deltaLink.
+// Uses calendarView/delta with a 30-day window. Returns empty Items on first
+// baseline call (deltaLink == ""). Resets automatically on 410 Gone.
+func (c *Client) DeltaEvents(ctx context.Context, deltaLink string) (DeltaResult[Event], error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	end := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339)
+	path := fmt.Sprintf(
+		"/me/calendarview/delta?startDateTime=%s&endDateTime=%s&$top=20&$select=id,subject,start,end",
+		now, end,
+	)
+	if deltaLink != "" {
+		stripped := strings.TrimPrefix(deltaLink, c.baseURL)
+		if stripped != deltaLink {
+			path = stripped
+		} else {
+			return c.deltaEventsFull(ctx, deltaLink)
+		}
+	}
+
+	var resp deltaResponse[graphEvent]
+	isBaseline := deltaLink == ""
+	err := c.get(ctx, path, &resp, map[string]string{"Prefer": `outlook.timezone="UTC"`})
+	if err != nil {
+		if strings.Contains(err.Error(), "410") {
+			return c.DeltaEvents(ctx, "")
+		}
+		return DeltaResult[Event]{}, err
+	}
+
+	items := resp.Value
+	for resp.NextLink != "" {
+		nextPath := strings.TrimPrefix(resp.NextLink, c.baseURL)
+		var next deltaResponse[graphEvent]
+		if err := c.get(ctx, nextPath, &next, map[string]string{"Prefer": `outlook.timezone="UTC"`}); err != nil {
+			break
+		}
+		items = append(items, next.Value...)
+		resp.NextLink = next.NextLink
+		resp.DeltaLink = next.DeltaLink
+	}
+
+	events := make([]Event, len(items))
+	for i, e := range items {
+		events[i] = Event{
+			ID:      e.ID,
+			Subject: e.Subject,
+			Start:   parseEventTime(e.Start.DateTime, e.Start.TimeZone),
+			End:     parseEventTime(e.End.DateTime, e.End.TimeZone),
+		}
+	}
+	result := DeltaResult[Event]{DeltaLink: resp.DeltaLink}
+	if !isBaseline {
+		result.Items = events
+	}
+	return result, nil
+}
+
+// deltaEventsFull handles deltaLink as a full external URL (test support).
+func (c *Client) deltaEventsFull(ctx context.Context, deltaLink string) (DeltaResult[Event], error) {
+	tok, err := c.auth.Token(ctx)
+	if err != nil {
+		return DeltaResult[Event]{}, fmt.Errorf("get token: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, deltaLink, nil)
+	if err != nil {
+		return DeltaResult[Event]{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	req.Header.Set("Accept", "application/json")
+
+	httpResp, err := c.http.Do(req)
+	if err != nil {
+		return DeltaResult[Event]{}, err
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+	if httpResp.StatusCode == http.StatusGone {
+		return c.DeltaEvents(ctx, "")
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return DeltaResult[Event]{}, fmt.Errorf("graph delta %s", httpResp.Status)
+	}
+	var resp deltaResponse[graphEvent]
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		return DeltaResult[Event]{}, err
+	}
+	events := make([]Event, len(resp.Value))
+	for i, e := range resp.Value {
+		events[i] = Event{
+			ID:      e.ID,
+			Subject: e.Subject,
+			Start:   parseEventTime(e.Start.DateTime, e.Start.TimeZone),
+			End:     parseEventTime(e.End.DateTime, e.End.TimeZone),
+		}
+	}
+	return DeltaResult[Event]{Items: events, DeltaLink: resp.DeltaLink}, nil
+}

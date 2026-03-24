@@ -71,6 +71,12 @@ func (f fakeGraph) GetOrCreateFolder(_ context.Context, _ string) (string, error
 func (f fakeGraph) MoveMessages(_ context.Context, _ []string, _ string) (int, int, error) {
 	return 0, 0, nil
 }
+func (f fakeGraph) DeltaMessages(_ context.Context, _ string) (graph.DeltaResult[graph.Message], error) {
+	return graph.DeltaResult[graph.Message]{}, nil
+}
+func (f fakeGraph) DeltaEvents(_ context.Context, _ string) (graph.DeltaResult[graph.Event], error) {
+	return graph.DeltaResult[graph.Event]{}, nil
+}
 
 // fakeLLM implements llmService.
 type fakeLLM struct {
