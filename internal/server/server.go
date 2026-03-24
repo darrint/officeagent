@@ -2671,6 +2671,28 @@ type feedCardJSON struct {
 	CreatedAt   string `json:"created_at"`
 }
 
+// feedCardTmpl is the template-safe version of feedCardJSON where SummaryHTML
+// is typed as template.HTML so html/template does not escape it.
+type feedCardTmpl struct {
+	ID          int64
+	Source      string
+	SummaryHTML template.HTML
+	TimeLabel   string
+	EventCount  int
+	CreatedAt   string
+}
+
+func feedCardToTmpl(c store.FeedCard) feedCardTmpl {
+	return feedCardTmpl{
+		ID:          c.ID,
+		Source:      c.Source,
+		SummaryHTML: template.HTML(c.SummaryHTML), //nolint:gosec // HTML rendered by goldmark from LLM markdown
+		TimeLabel:   c.TimeLabel,
+		EventCount:  c.EventCount,
+		CreatedAt:   c.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
 func feedCardToJSON(c store.FeedCard) feedCardJSON {
 	return feedCardJSON{
 		ID:          c.ID,
@@ -2697,8 +2719,12 @@ func (s *Server) handleFeedPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("list feed cards: %v", err), http.StatusInternalServerError)
 		return
 	}
+	tmplCards := make([]feedCardTmpl, len(cards))
+	for i, c := range cards {
+		tmplCards[i] = feedCardToTmpl(c)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := feedTmpl.Execute(w, cards); err != nil {
+	if err := feedTmpl.Execute(w, tmplCards); err != nil {
 		log.Printf("feed template: %v", err)
 	}
 }
