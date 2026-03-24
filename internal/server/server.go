@@ -21,9 +21,11 @@ import (
 	agentprivatebin "github.com/darrint/officeagent/internal/agent/privatebin"
 	"github.com/darrint/officeagent/internal/config"
 	"github.com/darrint/officeagent/internal/fastmail"
+	feedPkg "github.com/darrint/officeagent/internal/feed"
 	github "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/graph"
 	"github.com/darrint/officeagent/internal/llm"
+	"github.com/darrint/officeagent/internal/poller"
 	"github.com/darrint/officeagent/internal/store"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
@@ -178,6 +180,60 @@ func (b *progressBus) reset() {
 	b.mu.Unlock()
 }
 
+// feedEvent carries a per-source count of newly inserted feed events.
+// The browser receives this via SSE and shows a "N new events" banner.
+type feedEvent struct {
+	Counts map[string]int `json:"counts"` // source -> inserted count
+}
+
+// feedBus fans out feed new-event notifications to all connected SSE clients.
+type feedBus struct {
+	mu      sync.Mutex
+	clients map[chan feedEvent]struct{}
+}
+
+func newFeedBus() *feedBus {
+	return &feedBus{clients: make(map[chan feedEvent]struct{})}
+}
+
+// subscribe registers a new SSE client and returns its channel.
+func (b *feedBus) subscribe() chan feedEvent {
+	ch := make(chan feedEvent, 16)
+	b.mu.Lock()
+	b.clients[ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
+}
+
+// unsubscribe removes a client channel.
+func (b *feedBus) unsubscribe(ch chan feedEvent) {
+	b.mu.Lock()
+	delete(b.clients, ch)
+	b.mu.Unlock()
+}
+
+// Publish sends counts to all current subscribers. Implements poller.FeedBus.
+func (b *feedBus) Publish(counts map[string]int) {
+	ev := feedEvent{Counts: counts}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.clients {
+		select {
+		case ch <- ev:
+		default: // drop if client is too slow
+		}
+	}
+}
+
+// pollAdapter wraps a method with the signature expected by poller.Agent.
+type pollAdapter struct {
+	fn func(ctx context.Context, s *store.Store) ([]feedPkg.RawEvent, error)
+}
+
+func (a pollAdapter) Poll(ctx context.Context, s *store.Store) ([]feedPkg.RawEvent, error) {
+	return a.fn(ctx, s)
+}
+
 // Server is the officeagent HTTP server.
 type Server struct {
 	cfg      *config.Config
@@ -203,6 +259,8 @@ type Server struct {
 	pendingLogins map[string]pendingLogin // state -> pending
 
 	progress *progressBus // SSE fan-out for briefing generation progress
+	feed     *feedBus    // SSE fan-out for new feed-event notifications
+	poller   *poller.Poller
 }
 
 // serverOption is a functional option for New.
@@ -342,6 +400,7 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 		alog:          activitylog.NewDiscard(),
 		pendingLogins: make(map[string]pendingLogin),
 		progress:      newProgressBus(),
+		feed:          newFeedBus(),
 	}
 	// Apply functional options (e.g. WithActivityLog).
 	for _, opt := range opts {
@@ -383,6 +442,16 @@ func New(cfg *config.Config, auth *graph.Auth, client *graph.Client, llmClient *
 		log.Printf("privatebin agent configure: %v", err)
 	}
 
+	// Construct the background feed poller with all configured agents.
+	// Each agent adapts its own Poll method to the poller.Agent interface.
+	feedAgents := []poller.Agent{
+		pollAdapter{fn: s.graphAgent.PollMail},
+		pollAdapter{fn: s.graphAgent.PollCalendar},
+		pollAdapter{fn: s.githubAgent.Poll},
+		pollAdapter{fn: s.fastmailAgent.Poll},
+	}
+	s.poller = poller.New(feedAgents, st, s.feed, 0)
+
 	s.routes()
 	return s
 }
@@ -409,6 +478,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/llm/ping", s.handleLLMPing)
 	s.mux.HandleFunc("GET /reports", s.handleReportsList)
 	s.mux.HandleFunc("GET /reports/{id}", s.handleReportView)
+	// Feed routes
+	s.mux.HandleFunc("GET /feed", s.handleFeedPage)
+	s.mux.HandleFunc("GET /feed/events", s.handleFeedEvents)
+	s.mux.HandleFunc("GET /feed/cards", s.handleFeedCards)
+	s.mux.HandleFunc("POST /feed/summarize", s.handleFeedSummarize)
 }
 
 // Run starts the HTTP server and blocks until it returns an error.
@@ -1535,7 +1609,12 @@ func (s *Server) sendNtfyReport(ctx context.Context) error {
 // StartScheduler launches a background goroutine that wakes at 7:00 AM local
 // time each day, generates a briefing, and sends it via ntfy.sh. It returns
 // immediately; the goroutine runs until ctx is cancelled.
+// It also starts the feed poller (15-minute tick).
 func (s *Server) StartScheduler(ctx context.Context) {
+	// Start the background feed poller.
+	if s.poller != nil {
+		s.poller.Start(ctx)
+	}
 	go func() {
 		for {
 			next := nextSevenAM(time.Now().In(easternLoc))
@@ -2576,3 +2655,402 @@ func (s *Server) handleReportView(w http.ResponseWriter, r *http.Request) {
 		log.Printf("report-view template: %v", err)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Feed handlers (oa-1bl, oa-qcw, oa-9sk)
+// --------------------------------------------------------------------------
+
+// feedCardJSON is the wire format for a FeedCard returned by /feed/cards and
+// /feed/summarize.
+type feedCardJSON struct {
+	ID          int64  `json:"id"`
+	Source      string `json:"source"`
+	SummaryHTML string `json:"summary_html"`
+	TimeLabel   string `json:"time_label"`
+	EventCount  int    `json:"event_count"`
+	CreatedAt   string `json:"created_at"`
+}
+
+func feedCardToJSON(c store.FeedCard) feedCardJSON {
+	return feedCardJSON{
+		ID:          c.ID,
+		Source:      c.Source,
+		SummaryHTML: c.SummaryHTML,
+		TimeLabel:   c.TimeLabel,
+		EventCount:  c.EventCount,
+		CreatedAt:   c.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+// handleFeedPage renders the /feed timeline page (oa-9sk).
+func (s *Server) handleFeedPage(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.IsAuthenticated(r.Context()) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "store not initialised", http.StatusInternalServerError)
+		return
+	}
+	cards, err := s.store.ListFeedCards(20, 0)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list feed cards: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := feedTmpl.Execute(w, cards); err != nil {
+		log.Printf("feed template: %v", err)
+	}
+}
+
+// handleFeedEvents streams new-event notifications to the browser via SSE (oa-1bl).
+func (s *Server) handleFeedEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch := s.feed.subscribe()
+	defer s.feed.unsubscribe(ch)
+
+	// Send an initial keep-alive comment so the browser knows the connection is live.
+	if _, err := fmt.Fprint(w, ": connected\n\n"); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev := <-ch:
+			data, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// handleFeedCards returns a JSON array of feed cards for cursor-based
+// pagination. Query params: before=<id> (0 or absent = no cursor), limit (max 50).
+func (s *Server) handleFeedCards(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		http.Error(w, "store not initialised", http.StatusInternalServerError)
+		return
+	}
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 50 {
+			limit = n
+		}
+	}
+	var beforeID int64
+	if b := r.URL.Query().Get("before"); b != "" {
+		if n, err := strconv.ParseInt(b, 10, 64); err == nil {
+			beforeID = n
+		}
+	}
+	cards, err := s.store.ListFeedCards(limit, beforeID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list feed cards: %v", err), http.StatusInternalServerError)
+		return
+	}
+	out := make([]feedCardJSON, len(cards))
+	for i, c := range cards {
+		out[i] = feedCardToJSON(c)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// llmFeedCard is the shape the LLM is asked to return.
+type llmFeedCard struct {
+	TimeLabel       string `json:"time_label"`
+	SummaryMarkdown string `json:"summary_markdown"`
+}
+
+// handleFeedSummarize fetches unseen events, calls the LLM, and saves new
+// feed cards. Returns a JSON array of the new cards (oa-qcw).
+func (s *Server) handleFeedSummarize(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		http.Error(w, "store not initialised", http.StatusInternalServerError)
+		return
+	}
+	llmC := s.getLLM()
+	if llmC == nil {
+		http.Error(w, "LLM not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Collect unseen events per source.
+	sources := []string{"graph_mail", "graph_calendar", "github", "fastmail"}
+	var allNewCards []feedCardJSON
+
+	for _, source := range sources {
+		events, err := s.store.ListUnseenFeedEvents(source)
+		if err != nil {
+			log.Printf("feed/summarize: list unseen %s: %v", source, err)
+			continue
+		}
+		if len(events) == 0 {
+			continue
+		}
+
+		// Build JSON payload for the LLM.
+		payloads := make([]json.RawMessage, 0, len(events))
+		var oldest, newest time.Time
+		for _, ev := range events {
+			payloads = append(payloads, json.RawMessage(ev.Payload))
+			if oldest.IsZero() || ev.OccurredAt.Before(oldest) {
+				oldest = ev.OccurredAt
+			}
+			if ev.OccurredAt.After(newest) {
+				newest = ev.OccurredAt
+			}
+		}
+		eventsJSON, err := json.Marshal(payloads)
+		if err != nil {
+			log.Printf("feed/summarize: marshal events %s: %v", source, err)
+			continue
+		}
+
+		systemPrompt := "You are a helpful assistant summarizing notification feed events. " +
+			"Given a JSON array of events from source \"" + source + "\", produce a JSON array " +
+			"of summary cards. Each card must have: time_label (a short human-readable string " +
+			"like \"This morning\" or \"Yesterday\") and summary_markdown (a concise markdown " +
+			"summary). You decide how many cards to produce (1–5) based on whether events " +
+			"cluster into distinct topics. Respond with ONLY a valid JSON array, no other text."
+
+		reply, err := llmC.Chat(r.Context(), []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: string(eventsJSON)},
+		})
+		if err != nil {
+			log.Printf("feed/summarize: LLM %s: %v", source, err)
+			continue
+		}
+
+		// Parse the LLM reply as JSON array of llmFeedCard.
+		cards := parseLLMFeedCards(reply)
+		if len(cards) == 0 {
+			log.Printf("feed/summarize: LLM returned no cards for %s", source)
+			continue
+		}
+
+		// Persist each card and mark events.
+		eventIDs := make([]int64, len(events))
+		for i, ev := range events {
+			eventIDs[i] = ev.ID
+		}
+
+		md := newMarkdownRenderer()
+		for _, lc := range cards {
+			var htmlBuf bytes.Buffer
+			if err := md.Convert([]byte(lc.SummaryMarkdown), &htmlBuf); err != nil {
+				htmlBuf.WriteString(lc.SummaryMarkdown) // fallback to raw
+			}
+			fc := store.FeedCard{
+				Source:      source,
+				SummaryMD:   lc.SummaryMarkdown,
+				SummaryHTML: htmlBuf.String(),
+				EventCount:  len(events),
+				TimeLabel:   lc.TimeLabel,
+				OldestAt:    oldest,
+				NewestAt:    newest,
+			}
+			cardID, err := s.store.SaveFeedCard(fc)
+			if err != nil {
+				log.Printf("feed/summarize: save card %s: %v", source, err)
+				continue
+			}
+			if err := s.store.MarkFeedEventsWithCard(eventIDs, cardID); err != nil {
+				log.Printf("feed/summarize: mark events %s: %v", source, err)
+			}
+			fc.ID = cardID
+			allNewCards = append(allNewCards, feedCardToJSON(fc))
+		}
+	}
+
+	out := make([]feedCardJSON, len(allNewCards))
+	copy(out, allNewCards)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// parseLLMFeedCards extracts a JSON array of llmFeedCard from an LLM reply
+// that may include surrounding markdown fences.
+func parseLLMFeedCards(reply string) []llmFeedCard {
+	s := strings.TrimSpace(reply)
+	// Strip ```json ... ``` fences if present.
+	if idx := strings.Index(s, "```"); idx >= 0 {
+		s = s[idx+3:]
+		if nl := strings.Index(s, "\n"); nl >= 0 {
+			s = s[nl+1:]
+		}
+		if end := strings.LastIndex(s, "```"); end >= 0 {
+			s = s[:end]
+		}
+	}
+	s = strings.TrimSpace(s)
+	start := strings.Index(s, "[")
+	end := strings.LastIndex(s, "]")
+	if start < 0 || end <= start {
+		return nil
+	}
+	var cards []llmFeedCard
+	if err := json.Unmarshal([]byte(s[start:end+1]), &cards); err != nil {
+		log.Printf("parseLLMFeedCards: unmarshal error: %v", err)
+		return nil
+	}
+	return cards
+}
+
+// newMarkdownRenderer returns a goldmark renderer suitable for feed card HTML.
+func newMarkdownRenderer() goldmark.Markdown {
+	return goldmark.New(goldmark.WithExtensions(extension.GFM))
+}
+
+// feedTmpl is the /feed timeline page template.
+var feedTmpl = template.Must(template.New("feed").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>officeagent — Feed</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f5;color:#1a1a1a;padding:2rem 1rem;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:1rem;margin-bottom:2rem;border-bottom:2px solid #0078d4;padding-bottom:.75rem}
+header h1{font-size:1.4rem;color:#0078d4;font-weight:700;letter-spacing:-.5px}
+header a{color:#0078d4;text-decoration:none;font-size:.9rem}
+.banner{position:sticky;top:0;background:#0078d4;color:#fff;text-align:center;padding:.5rem 1rem;border-radius:4px;margin-bottom:1rem;display:none;cursor:pointer;z-index:10}
+.card{background:#fff;border-radius:8px;padding:1.25rem 1.5rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.card-meta{font-size:.8rem;color:#666;margin-bottom:.5rem}
+.card-source{display:inline-block;background:#e0efff;color:#005a9e;border-radius:4px;padding:.1rem .5rem;font-size:.75rem;font-weight:600;margin-right:.4rem;text-transform:uppercase}
+.card-content{font-size:.95rem}
+.card-content ul{margin:.4rem 0 .4rem 1.4rem}
+.load-more{display:block;text-align:center;margin:1rem auto;padding:.6rem 1.5rem;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.9rem}
+.load-more:disabled{background:#999;cursor:default}
+.empty{text-align:center;color:#666;padding:3rem 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>officeagent</h1>
+  <a href="/">Home</a>
+  <a href="/settings">Settings</a>
+  <a href="/doctor">Doctor</a>
+</header>
+
+<div id="banner" class="banner" onclick="loadNew()">
+  <span id="banner-text">New events available</span> — click to summarize
+</div>
+
+<div id="feed">
+{{range .}}
+<div class="card" data-id="{{.ID}}">
+  <div class="card-meta">
+    <span class="card-source">{{.Source}}</span>
+    <strong>{{.TimeLabel}}</strong>
+    &nbsp;·&nbsp;{{.EventCount}} event{{if ne .EventCount 1}}s{{end}}
+  </div>
+  <div class="card-content">{{.SummaryHTML}}</div>
+</div>
+{{else}}
+<div class="empty">No events yet — the poller runs every 15 minutes.</div>
+{{end}}
+</div>
+
+<button id="load-more" class="load-more" onclick="loadMore()">Load earlier</button>
+
+</div>
+<script>
+let oldestID = 0;
+(function(){
+  const cards = document.querySelectorAll('.card[data-id]');
+  cards.forEach(c => {
+    const id = parseInt(c.dataset.id, 10);
+    if (id > 0 && (oldestID === 0 || id < oldestID)) oldestID = id;
+  });
+})();
+
+// SSE connection for new-event notifications.
+const es = new EventSource('/feed/events');
+let pendingCounts = {};
+es.onmessage = function(e) {
+  const data = JSON.parse(e.data);
+  if (data.counts) {
+    let total = 0;
+    Object.keys(data.counts).forEach(k => {
+      pendingCounts[k] = (pendingCounts[k] || 0) + data.counts[k];
+      total += data.counts[k];
+    });
+    if (total > 0) {
+      document.getElementById('banner-text').textContent = total + ' new event' + (total !== 1 ? 's' : '') + ' available';
+      document.getElementById('banner').style.display = 'block';
+    }
+  }
+};
+
+function loadNew() {
+  document.getElementById('banner').style.display = 'none';
+  pendingCounts = {};
+  fetch('/feed/summarize', {method: 'POST'})
+    .then(r => r.json())
+    .then(cards => {
+      const feed = document.getElementById('feed');
+      const empty = feed.querySelector('.empty');
+      if (empty) empty.remove();
+      cards.forEach(c => {
+        const div = document.createElement('div');
+        div.className = 'card';
+        div.dataset.id = c.id;
+        div.innerHTML =
+          '<div class="card-meta"><span class="card-source">' + c.source + '</span>' +
+          '<strong>' + (c.time_label || '') + '</strong>' +
+          ' &nbsp;·&nbsp; ' + c.event_count + ' event' + (c.event_count !== 1 ? 's' : '') + '</div>' +
+          '<div class="card-content">' + c.summary_html + '</div>';
+        feed.insertBefore(div, feed.firstChild);
+      });
+    })
+    .catch(err => console.error('summarize error:', err));
+}
+
+function loadMore() {
+  const btn = document.getElementById('load-more');
+  btn.disabled = true;
+  const url = '/feed/cards?limit=20' + (oldestID > 0 ? '&before=' + oldestID : '');
+  fetch(url)
+    .then(r => r.json())
+    .then(cards => {
+      const feed = document.getElementById('feed');
+      cards.forEach(c => {
+        const div = document.createElement('div');
+        div.className = 'card';
+        div.dataset.id = c.id;
+        div.innerHTML =
+          '<div class="card-meta"><span class="card-source">' + c.source + '</span>' +
+          '<strong>' + (c.time_label || '') + '</strong>' +
+          ' &nbsp;·&nbsp; ' + c.event_count + ' event' + (c.event_count !== 1 ? 's' : '') + '</div>' +
+          '<div class="card-content">' + c.summary_html + '</div>';
+        feed.appendChild(div);
+        if (c.id > 0 && (oldestID === 0 || c.id < oldestID)) oldestID = c.id;
+      });
+      btn.disabled = cards.length === 0;
+    })
+    .catch(err => { console.error('load more error:', err); btn.disabled = false; });
+}
+</script>
+</body>
+</html>`))
