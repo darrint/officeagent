@@ -2879,16 +2879,22 @@ func (s *Server) handleFeedSummarize(w http.ResponseWriter, r *http.Request) {
 		}
 
 		md := newMarkdownRenderer()
-		for _, lc := range cards {
+		nCards := len(cards)
+		for idx, lc := range cards {
 			var htmlBuf bytes.Buffer
 			if err := md.Convert([]byte(lc.SummaryMarkdown), &htmlBuf); err != nil {
 				htmlBuf.WriteString(lc.SummaryMarkdown) // fallback to raw
+			}
+			// Distribute event count evenly across cards; remainder goes to first card.
+			count := len(events) / nCards
+			if idx == 0 {
+				count += len(events) % nCards
 			}
 			fc := store.FeedCard{
 				Source:      source,
 				SummaryMD:   lc.SummaryMarkdown,
 				SummaryHTML: htmlBuf.String(),
-				EventCount:  len(events),
+				EventCount:  count,
 				TimeLabel:   lc.TimeLabel,
 				OldestAt:    oldest,
 				NewestAt:    newest,
