@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/darrint/officeagent/internal/agent"
+	"github.com/darrint/officeagent/internal/feed"
 	fastmailclient "github.com/darrint/officeagent/internal/fastmail"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
@@ -29,6 +30,14 @@ type fastmailMover interface {
 	ListMessages(ctx context.Context, top int) ([]fastmailclient.Message, error)
 	GetOrCreateMailbox(ctx context.Context, name string) (string, error)
 	MoveMessages(ctx context.Context, messageIDs []string, targetMailboxID string) error
+}
+
+// fastmailPoller is optionally implemented by the Fastmail client for
+// incremental delta-based polling.
+type fastmailPoller interface {
+	GetInitialEmailState(ctx context.Context) (string, error)
+	EmailChanges(ctx context.Context, sinceState string) (fastmailclient.EmailChangesResult, error)
+	GetMessages(ctx context.Context, ids []string) ([]fastmailclient.Message, error)
 }
 
 // readOnlyChecker is optionally implemented by the Fastmail client.
@@ -219,6 +228,82 @@ func (a *Agent) ArchiveLowPrio(ctx context.Context, llmC LLMClient, cachedIDs []
 		return 0, fmt.Errorf("move messages: %w", err)
 	}
 	return len(ids), nil
+}
+
+// Poll fetches new messages since the last poll using JMAP Email/changes.
+// On the first call (no stored state) it stores the current state as baseline
+// and returns an empty slice — no cards are generated from the baseline.
+// Returns feed.RawEvent items only for newly created messages.
+func (a *Agent) Poll(ctx context.Context, s *store.Store) ([]feed.RawEvent, error) {
+	if a.client == nil {
+		return nil, nil
+	}
+	poller, ok := any(a.client).(fastmailPoller)
+	if !ok {
+		return nil, nil // client doesn't support polling
+	}
+
+	fs, err := s.GetFeedState("fastmail")
+	if err != nil {
+		return nil, fmt.Errorf("get feed state: %w", err)
+	}
+
+	// First run: establish baseline, return empty.
+	if fs.DeltaToken == "" {
+		state, err := poller.GetInitialEmailState(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get initial email state: %w", err)
+		}
+		fs.DeltaToken = state
+		fs.LastPoll = time.Now().UTC()
+		if err := s.SetFeedState(fs); err != nil {
+			log.Printf("fastmail agent: save feed state: %v", err)
+		}
+		return nil, nil
+	}
+
+	changes, err := poller.EmailChanges(ctx, fs.DeltaToken)
+	if err != nil {
+		return nil, fmt.Errorf("email/changes: %w", err)
+	}
+
+	// Persist the new state regardless of whether there were changes.
+	if changes.NewState != "" && changes.NewState != fs.DeltaToken {
+		fs.DeltaToken = changes.NewState
+		fs.LastPoll = time.Now().UTC()
+		if err := s.SetFeedState(fs); err != nil {
+			log.Printf("fastmail agent: save feed state: %v", err)
+		}
+	}
+
+	if len(changes.Created) == 0 {
+		return nil, nil
+	}
+
+	// Fetch details for created messages only (updates/deletes are not surfaced
+	// as new feed events).
+	msgs, err := poller.GetMessages(ctx, changes.Created)
+	if err != nil {
+		return nil, fmt.Errorf("get messages: %w", err)
+	}
+
+	events := make([]feed.RawEvent, 0, len(msgs))
+	for _, m := range msgs {
+		payload, _ := json.Marshal(map[string]string{
+			"id":         m.ID,
+			"subject":    m.Subject,
+			"from":       m.From,
+			"preview":    m.BodyPreview,
+			"receivedAt": m.ReceivedAt.UTC().Format(time.RFC3339),
+		})
+		events = append(events, feed.RawEvent{
+			Source:     "fastmail",
+			ExternalID: m.ID,
+			Payload:    string(payload),
+			OccurredAt: m.ReceivedAt,
+		})
+	}
+	return events, nil
 }
 
 // SetClient replaces the underlying Fastmail API client. Used by reinitClients
