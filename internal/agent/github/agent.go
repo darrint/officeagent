@@ -4,12 +4,15 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/darrint/officeagent/internal/agent"
+	"github.com/darrint/officeagent/internal/feed"
 	githubclient "github.com/darrint/officeagent/internal/github"
 	"github.com/darrint/officeagent/internal/llm"
 	"github.com/darrint/officeagent/internal/store"
@@ -174,6 +177,103 @@ func (a *Agent) PRSummary(ctx context.Context, llmC LLMClient, feedbackCtx strin
 		return "", fmt.Errorf("LLM chat: %w", err)
 	}
 	return reply, nil
+}
+
+// Poll fetches PRs updated since the stored cursor and returns them as
+// feed.RawEvents. The cursor is stored in feed_state["github"].delta_token as
+// an RFC3339 timestamp. On the first call the cursor defaults to 24 hours ago.
+// After each poll the cursor is advanced to the most recent PR's UpdatedAt.
+func (a *Agent) Poll(ctx context.Context, s *store.Store) ([]feed.RawEvent, error) {
+	if a.client == nil {
+		return nil, nil
+	}
+
+	fs, err := s.GetFeedState("github")
+	if err != nil {
+		return nil, fmt.Errorf("get feed state: %w", err)
+	}
+
+	var since time.Time
+	if fs.DeltaToken != "" {
+		since, err = time.Parse(time.RFC3339, fs.DeltaToken)
+		if err != nil {
+			log.Printf("github agent: bad delta_token %q: %v — resetting", fs.DeltaToken, err)
+			since = time.Time{}
+		}
+	}
+	if since.IsZero() {
+		since = time.Now().UTC().Add(-24 * time.Hour)
+	}
+
+	prs, err := a.client.ListRecentPRs(ctx, since, a.orgs, a.username)
+	if err != nil {
+		return nil, fmt.Errorf("list PRs: %w", err)
+	}
+
+	// Advance cursor to the latest UpdatedAt seen.
+	latest := since
+	for _, pr := range prs {
+		if pr.UpdatedAt.After(latest) {
+			latest = pr.UpdatedAt
+		}
+	}
+	if latest.After(since) {
+		fs.DeltaToken = latest.UTC().Format(time.RFC3339)
+		fs.LastPoll = time.Now().UTC()
+		if err := s.SetFeedState(fs); err != nil {
+			log.Printf("github agent: save feed state: %v", err)
+		}
+	}
+
+	events := make([]feed.RawEvent, 0, len(prs))
+	for _, pr := range prs {
+		// Build a condensed payload for LLM consumption.
+		type commentPayload struct {
+			Author string `json:"author"`
+			Body   string `json:"body"`
+		}
+		type reviewPayload struct {
+			Author string `json:"author"`
+			State  string `json:"state"`
+		}
+		type prPayload struct {
+			Number   int              `json:"number"`
+			Title    string           `json:"title"`
+			Repo     string           `json:"repo"`
+			State    string           `json:"state"`
+			Author   string           `json:"author"`
+			URL      string           `json:"url"`
+			Comments []commentPayload `json:"comments"`
+			Reviews  []reviewPayload  `json:"reviews"`
+		}
+		p := prPayload{
+			Number: pr.Number,
+			Title:  pr.Title,
+			Repo:   pr.Repo,
+			State:  pr.State,
+			Author: pr.Author,
+			URL:    pr.HTMLURL,
+		}
+		for _, c := range pr.Comments {
+			p.Comments = append(p.Comments, commentPayload{Author: c.Author, Body: c.Body})
+		}
+		for _, r := range pr.Reviews {
+			p.Reviews = append(p.Reviews, reviewPayload{Author: r.Author, State: r.State})
+		}
+		payload, _ := json.Marshal(p)
+		// Use repo#number as the external ID for deduplication; each poll
+		// update for the same PR overwrites via ON CONFLICT IGNORE, meaning
+		// only the first-seen snapshot is stored. This is intentional: the
+		// feed captures that the PR was active, not every incremental update.
+		externalID := fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
+		events = append(events, feed.RawEvent{
+			Source:     "github",
+			ExternalID: externalID,
+			Payload:    string(payload),
+			OccurredAt: pr.UpdatedAt,
+		})
+	}
+	return events, nil
 }
 
 // Token returns the configured GitHub token.
