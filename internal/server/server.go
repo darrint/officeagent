@@ -2677,6 +2677,7 @@ type feedCardJSON struct {
 	SummaryHTML string `json:"summary_html"`
 	TimeLabel   string `json:"time_label"`
 	EventCount  int    `json:"event_count"`
+	NewestAt    string `json:"newest_at"`
 	CreatedAt   string `json:"created_at"`
 }
 
@@ -2688,6 +2689,7 @@ type feedCardTmpl struct {
 	SummaryHTML template.HTML
 	TimeLabel   string
 	EventCount  int
+	NewestAt    string
 	CreatedAt   string
 }
 
@@ -2698,6 +2700,7 @@ func feedCardToTmpl(c store.FeedCard) feedCardTmpl {
 		SummaryHTML: template.HTML(c.SummaryHTML), //nolint:gosec // HTML rendered by goldmark from LLM markdown
 		TimeLabel:   c.TimeLabel,
 		EventCount:  c.EventCount,
+		NewestAt:    c.NewestAt.In(easternLoc).Format("Jan 2, 3:04 PM MST"),
 		CreatedAt:   c.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
@@ -2709,6 +2712,7 @@ func feedCardToJSON(c store.FeedCard) feedCardJSON {
 		SummaryHTML: c.SummaryHTML,
 		TimeLabel:   c.TimeLabel,
 		EventCount:  c.EventCount,
+		NewestAt:    c.NewestAt.In(easternLoc).Format("Jan 2, 3:04 PM MST"),
 		CreatedAt:   c.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
@@ -2978,6 +2982,7 @@ header a{color:#0078d4;text-decoration:none;font-size:.9rem}
 .card{background:#fff;border-radius:8px;padding:1.25rem 1.5rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}
 .card-meta{font-size:.8rem;color:#666;margin-bottom:.5rem}
 .card-source{display:inline-block;background:#e0efff;color:#005a9e;border-radius:4px;padding:.1rem .5rem;font-size:.75rem;font-weight:600;margin-right:.4rem;text-transform:uppercase}
+.card-ts{color:#aaa;font-size:.75rem}
 .card-content{font-size:.95rem}
 .card-content ul{margin:.4rem 0 .4rem 1.4rem}
 .load-more{display:block;text-align:center;margin:1rem auto;padding:.6rem 1.5rem;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.9rem}
@@ -3005,6 +3010,7 @@ header a{color:#0078d4;text-decoration:none;font-size:.9rem}
     <span class="card-source">{{.Source}}</span>
     <strong>{{.TimeLabel}}</strong>
     &nbsp;·&nbsp;{{.EventCount}} event{{if ne .EventCount 1}}s{{end}}
+    &nbsp;·&nbsp;<span class="card-ts">{{.NewestAt}}</span>
   </div>
   <div class="card-content">{{.SummaryHTML}}</div>
 </div>
@@ -3064,7 +3070,8 @@ function loadNew() {
         div.innerHTML =
           '<div class="card-meta"><span class="card-source">' + c.source + '</span>' +
           '<strong>' + (c.time_label || '') + '</strong>' +
-          ' &nbsp;·&nbsp; ' + c.event_count + ' event' + (c.event_count !== 1 ? 's' : '') + '</div>' +
+          ' &nbsp;·&nbsp; ' + c.event_count + ' event' + (c.event_count !== 1 ? 's' : '') +
+          ' &nbsp;·&nbsp; <span class="card-ts">' + (c.newest_at || '') + '</span></div>' +
           '<div class="card-content">' + c.summary_html + '</div>';
         feed.insertBefore(div, feed.firstChild);
       });
@@ -3095,7 +3102,8 @@ function loadMore() {
         div.innerHTML =
           '<div class="card-meta"><span class="card-source">' + c.source + '</span>' +
           '<strong>' + (c.time_label || '') + '</strong>' +
-          ' &nbsp;·&nbsp; ' + c.event_count + ' event' + (c.event_count !== 1 ? 's' : '') + '</div>' +
+          ' &nbsp;·&nbsp; ' + c.event_count + ' event' + (c.event_count !== 1 ? 's' : '') +
+          ' &nbsp;·&nbsp; <span class="card-ts">' + (c.newest_at || '') + '</span></div>' +
           '<div class="card-content">' + c.summary_html + '</div>';
         feed.appendChild(div);
         if (c.id > 0 && (oldestID === 0 || c.id < oldestID)) oldestID = c.id;
