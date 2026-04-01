@@ -555,7 +555,7 @@ func (c *Client) DeltaEvents(ctx context.Context, deltaLink string) (DeltaResult
 	now := time.Now().UTC().Format(time.RFC3339)
 	end := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339)
 	path := fmt.Sprintf(
-		"/me/calendarview/delta?startDateTime=%s&endDateTime=%s&$top=20&$select=id,subject,start,end",
+		"/me/calendarview/delta?startDateTime=%s&endDateTime=%s&$select=id,subject,start,end",
 		now, end,
 	)
 	if deltaLink != "" {
@@ -569,7 +569,7 @@ func (c *Client) DeltaEvents(ctx context.Context, deltaLink string) (DeltaResult
 
 	var resp deltaResponse[graphEvent]
 	isBaseline := deltaLink == ""
-	err := c.get(ctx, path, &resp, map[string]string{"Prefer": `outlook.timezone="UTC"`})
+	err := c.get(ctx, path, &resp, map[string]string{"Prefer": `outlook.timezone="UTC", odata.maxpagesize=20`})
 	if err != nil {
 		if strings.Contains(err.Error(), "410") {
 			return c.DeltaEvents(ctx, "")
@@ -581,7 +581,7 @@ func (c *Client) DeltaEvents(ctx context.Context, deltaLink string) (DeltaResult
 	for resp.NextLink != "" {
 		nextPath := strings.TrimPrefix(resp.NextLink, c.baseURL)
 		var next deltaResponse[graphEvent]
-		if err := c.get(ctx, nextPath, &next, map[string]string{"Prefer": `outlook.timezone="UTC"`}); err != nil {
+		if err := c.get(ctx, nextPath, &next, map[string]string{"Prefer": `outlook.timezone="UTC", odata.maxpagesize=20`}); err != nil {
 			break
 		}
 		items = append(items, next.Value...)
