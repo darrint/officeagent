@@ -1616,9 +1616,16 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	if s.poller != nil {
 		s.poller.Start(ctx)
 	}
+
+	// Warn at startup if ntfy is not configured.
+	if topic := strings.TrimSpace(s.getSetting("ntfy_topic", "")); topic == "" {
+		log.Println("scheduler: ntfy_topic not configured — morning briefing will not be sent until it is set")
+	}
+
 	go func() {
 		for {
 			next := nextSevenAM(time.Now().In(easternLoc))
+			log.Printf("scheduler: next morning briefing scheduled for %s", next.Format("Mon Jan 2 2006 3:04:05 PM MST"))
 			timer := time.NewTimer(time.Until(next))
 			select {
 			case <-ctx.Done():
@@ -1628,14 +1635,15 @@ func (s *Server) StartScheduler(ctx context.Context) {
 			}
 			topic := strings.TrimSpace(s.getSetting("ntfy_topic", ""))
 			if topic == "" {
-				log.Println("scheduler: ntfy topic not configured, skipping send")
+				log.Println("scheduler: ntfy_topic not configured, skipping today's send")
 				continue
 			}
-			log.Println("scheduler: generating and sending 7 AM briefing via ntfy")
+			log.Println("scheduler: generating 7 AM briefing")
 			if _, err := s.GenerateBriefing(ctx); err != nil {
 				log.Printf("scheduler: generate briefing failed: %v", err)
 				continue
 			}
+			log.Println("scheduler: sending briefing via ntfy")
 			if err := s.sendNtfyReport(ctx); err != nil {
 				log.Printf("scheduler: ntfy send failed: %v", err)
 			} else {
